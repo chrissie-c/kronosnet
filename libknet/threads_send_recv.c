@@ -32,13 +32,13 @@
  * SEND
  */
 
-static int _dispatch_to_links(knet_handle_t knet_h, struct knet_host *dst_host, struct iovec *iov_out)
+static int _dispatch_to_links(knet_handle_t knet_h, struct knet_host *dst_host, struct iovec iov_out[][2], int iovcnt_out)
 {
 	int link_idx, msg_idx, sent_msgs, msgs_to_send, prev_sent, progress;
 	struct mmsghdr msg[PCKT_FRAG_MAX];
 	int err = 0, savederrno = 0;
 
-	memset(&msg, 0, sizeof(struct mmsghdr));
+	memset(&msg, 0, sizeof(msg));
 
 	for (link_idx = 0; link_idx < dst_host->active_link_entries; link_idx++) {
 
@@ -51,11 +51,10 @@ retry:
 		msg_idx = 0;
 
 		while (msg_idx < msgs_to_send) {
-			memset(&msg[msg_idx].msg_hdr, 0, sizeof(struct msghdr));
 			msg[msg_idx].msg_hdr.msg_name = &dst_host->link[dst_host->active_links[link_idx]].dst_addr;
 			msg[msg_idx].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
-			msg[msg_idx].msg_hdr.msg_iov = &iov_out[msg_idx + prev_sent];
-			msg[msg_idx].msg_hdr.msg_iovlen = 1;
+			msg[msg_idx].msg_hdr.msg_iov = iov_out[msg_idx + prev_sent];
+			msg[msg_idx].msg_hdr.msg_iovlen = iovcnt_out;
 			msg_idx++;
 		}
 
@@ -125,7 +124,8 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 	size_t dst_host_ids_entries = 0;
 	int bcast = 1;
 	struct knet_hostinfo *knet_hostinfo;
-	struct iovec iov_out[PCKT_FRAG_MAX];
+	struct iovec iov_out[PCKT_FRAG_MAX][2];
+	int iovcnt_out = 2;
 	uint8_t frag_idx;
 	unsigned int temp_data_mtu;
 	int host_idx;
@@ -276,15 +276,17 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 		/*
 		 * set the iov_base
 		 */
-		iov_out[frag_idx].iov_base = (void *)knet_h->send_to_links_buf[frag_idx];
+		iov_out[frag_idx][0].iov_base = (void *)knet_h->send_to_links_buf[frag_idx];
+		iov_out[frag_idx][0].iov_len = KNET_HEADER_DATA_SIZE;
+		iov_out[frag_idx][1].iov_base = inbuf->khp_data_userdata + (temp_data_mtu * frag_idx);
 
 		/*
 		 * set the len
 		 */
 		if (frag_len > temp_data_mtu) {
-			iov_out[frag_idx].iov_len = temp_data_mtu + KNET_HEADER_DATA_SIZE;
+			iov_out[frag_idx][1].iov_len = temp_data_mtu;
 		} else {
-			iov_out[frag_idx].iov_len = frag_len + KNET_HEADER_DATA_SIZE;
+			iov_out[frag_idx][1].iov_len = frag_len;
 		}
 
 		/*
@@ -295,10 +297,6 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 		knet_h->send_to_links_buf[frag_idx]->khp_data_frag_num = inbuf->khp_data_frag_num;
 		knet_h->send_to_links_buf[frag_idx]->khp_data_bcast = inbuf->khp_data_bcast;
 		knet_h->send_to_links_buf[frag_idx]->khp_data_channel = inbuf->khp_data_channel;
-
-		memmove(knet_h->send_to_links_buf[frag_idx]->khp_data_userdata,
-			inbuf->khp_data_userdata + (temp_data_mtu * frag_idx),
-			iov_out[frag_idx].iov_len - KNET_HEADER_DATA_SIZE);
 
 		frag_len = frag_len - temp_data_mtu;
 
@@ -320,10 +318,9 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 				knet_h->send_to_links_buf[frag_idx]->khp_data_seq_num = knet_h->send_to_links_buf[0]->khp_data_seq_num;
 
 				if (knet_h->crypto_instance) {
-					if (crypto_encrypt_and_sign(
+					if (crypto_encrypt_and_signv(
 							knet_h,
-							(const unsigned char *)knet_h->send_to_links_buf[frag_idx],
-							iov_out[frag_idx].iov_len,
+							iov_out[frag_idx], 2,
 							knet_h->send_to_links_buf_crypt[frag_idx],
 							&outlen) < 0) {
 						log_debug(knet_h, KNET_SUB_SEND_T, "Unable to encrypt unicast packet");
@@ -331,19 +328,19 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 						err = -1;
 						goto out_unlock;
 					}
-					iov_out[frag_idx].iov_base = knet_h->send_to_links_buf_crypt[frag_idx];
-					iov_out[frag_idx].iov_len = outlen;
+					iov_out[frag_idx][0].iov_base = knet_h->send_to_links_buf_crypt[frag_idx];
+					iov_out[frag_idx][0].iov_len = outlen;
+					iovcnt_out = 1;
 				}
 
 				frag_idx++;
 			}
 
-			err = _dispatch_to_links(knet_h, dst_host, iov_out);
+			err = _dispatch_to_links(knet_h, dst_host, iov_out, iovcnt_out);
 			savederrno = errno;
 			if (err) {
 				goto out_unlock;
 			}
-
 		}
 
 	} else {
@@ -357,10 +354,9 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 			knet_h->send_to_links_buf[frag_idx]->khp_data_seq_num = knet_h->send_to_links_buf[0]->khp_data_seq_num;
 
 			if (knet_h->crypto_instance) {
-				if (crypto_encrypt_and_sign(
+				if (crypto_encrypt_and_signv(
 						knet_h,
-						(const unsigned char *)knet_h->send_to_links_buf[frag_idx],
-						iov_out[frag_idx].iov_len,
+						iov_out[frag_idx], 2,
 						knet_h->send_to_links_buf_crypt[frag_idx],
 						&outlen) < 0) {
 					log_debug(knet_h, KNET_SUB_SEND_T, "Unable to encrypt unicast packet");
@@ -368,8 +364,9 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 					err = -1;
 					goto out_unlock;
 				}
-				iov_out[frag_idx].iov_base = knet_h->send_to_links_buf_crypt[frag_idx];
-				iov_out[frag_idx].iov_len = outlen;
+				iov_out[frag_idx][0].iov_base = knet_h->send_to_links_buf_crypt[frag_idx];
+				iov_out[frag_idx][0].iov_len = outlen;
+				iovcnt_out = 1;
 			}
 
 			frag_idx++;
@@ -377,7 +374,7 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, int buf_idx, ssize_t inle
 
 		for (dst_host = knet_h->host_head; dst_host != NULL; dst_host = dst_host->next) {
 			if (dst_host->status.reachable) {
-				err = _dispatch_to_links(knet_h, dst_host, iov_out);
+				err = _dispatch_to_links(knet_h, dst_host, iov_out, iovcnt_out);
 				savederrno = errno;
 				if (err) {
 					goto out_unlock;
