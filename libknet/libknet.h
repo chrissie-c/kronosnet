@@ -930,9 +930,10 @@ int knet_addrtostr(const struct sockaddr_storage *ss, socklen_t sslen,
  * -1 on error and errno is set.
  */
 
-#define KNET_TRANSPORT_UDP   0
-#define KNET_TRANSPORT_SCTP  1
-#define KNET_MAX_TRANSPORTS  2
+#define KNET_TRANSPORT_UDP       0
+#define KNET_TRANSPORT_SCTP      1
+#define KNET_TRANSPORT_SCTP_MANY 2
+#define KNET_MAX_TRANSPORTS      3
 
 struct transport_info {
 	const char *name;   /* UDP/SCTP/etc... */

@@ -88,7 +88,7 @@ static void test(void)
 
 	expected_count = KNET_MAX_TRANSPORTS;
 #ifndef HAVE_NETINET_SCTP_H
-	expected_count--;
+	expected_count = expected_count - 2;
 #endif
 
 	if (transport_list_entries != expected_count) {

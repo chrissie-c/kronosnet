@@ -76,7 +76,7 @@ static void print_help(void)
 	printf(" -c [implementation]:[crypto]:[hashing]    crypto configuration. (default disabled)\n");
 	printf("                                           Example: -c nss:aes128:sha1\n");
 	printf(" -p [active|passive|rr]                    (default: passive)\n");
-	printf(" -P [udp|sctp]                             (default: udp) protocol (transport) to use\n");
+	printf(" -P [udp|sctp|sctp_many]                   (default: udp) protocol (transport) to use\n");
 	printf(" -t [nodeid]                               This nodeid (required)\n");
 	printf(" -n [nodeid],[link1_ip_addr],[link2_..]    Other nodes information (at least one required)\n");
 	printf("                                           Example: -t 1,192.168.8.1,3ffe::8:1,..\n");
@@ -273,8 +273,12 @@ static void setup_knet(int argc, char *argv[])
 					protocol = KNET_TRANSPORT_SCTP;
 					protofound = 1;
 				}
+				if (!strcmp(protostr, "sctp_many")) {
+					protocol = KNET_TRANSPORT_SCTP_MANY;
+					protofound = 1;
+				}
 				if (!protofound) {
-					printf("Error: invalid protocol %s specified. -P accepts udp|sctp\n", policystr);
+					printf("Error: invalid protocol %s specified. -P accepts udp|sctp|sctp_many\n", policystr);
 					exit(FAIL);
 				}
 				break;
