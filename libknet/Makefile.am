@@ -15,7 +15,7 @@ SYMFILE			= libknet_exported_syms
 
 EXTRA_DIST		= $(SYMFILE)
 
-SUBDIRS			= . tests
+SUBDIRS			= . tests man
 
 libversion		= 0:0:0
 

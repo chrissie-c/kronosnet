@@ -72,6 +72,9 @@ AC_PROG_CXX
 AC_PROG_RANLIB
 AC_CHECK_PROGS([PUBLICAN], [publican], [:])
 AC_CHECK_PROGS([PKGCONFIG], [pkg-config])
+AC_CHECK_PROGS([GROFF], [groff])
+
+AM_CONDITIONAL(BUILD_HTML_DOCS, test -n "${GROFF}")
 
 AC_ARG_ENABLE([libknet-sctp],
 	[  --disable-libknet-sctp            : disable libknet SCTP support ],,
@@ -477,6 +480,7 @@ AC_CONFIG_FILES([
 		libknet/Makefile
 		libknet/libknet.pc
 		libknet/tests/Makefile
+		libknet/man/Makefile
 		docs/Makefile
 		poc-code/Makefile
 		poc-code/iov-hash/Makefile
