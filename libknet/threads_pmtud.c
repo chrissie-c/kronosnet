@@ -10,6 +10,7 @@
 #include "config.h"
 
 #include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
@@ -37,12 +38,11 @@ static int _handle_check_link_pmtud(knet_handle_t knet_h, struct knet_host *dst_
 
 	struct timespec ts;
 	unsigned char *outbuf = (unsigned char *)knet_h->pmtudbuf;
+	size_t low_mtu, high_mtu;
 
 	mutex_retry_limit = 0;
 	failsafe = 0;
 	pad_len = 0;
-
-	dst_link->last_bad_mtu = 0;
 
 	knet_h->pmtudbuf->khp_pmtud_link = dst_link->link_id;
 
@@ -64,11 +64,21 @@ static int _handle_check_link_pmtud(knet_handle_t knet_h, struct knet_host *dst_
 	}
 
 	/*
-	 * discovery starts from the top because kernel will
-	 * refuse to send packets > current iface mtu.
-	 * this saves us some time and network bw.
-	 */ 
-	onwire_len = max_mtu_len;
+	 * discovery starts from the current known good MTU and then
+	 * Binary chops until we reach a usable number
+	 */
+
+	low_mtu = 0;
+	high_mtu = max_mtu_len;
+
+	if (dst_link->has_valid_mtu && dst_link->status.mtu) {
+		onwire_len = dst_link->status.mtu + dst_link->status.proto_overhead;
+	} else {
+		onwire_len = max_mtu_len;
+	}
+
+	log_err(knet_h, KNET_SUB_PMTUD, "CC: Starting pmtud with %d (from %d)", (int)onwire_len,
+		(int)dst_link->status.mtu);
 
 restart:
 
@@ -119,7 +129,7 @@ restart:
 			return -1;
 		}
 
-		onwire_len = data_len + overhead_len;
+//		onwire_len = data_len + overhead_len;
 		knet_h->pmtudbuf->khp_pmtud_size = onwire_len;
 
 		if (crypto_encrypt_and_sign(knet_h,
@@ -180,6 +190,27 @@ retry:
 	if (len != (ssize_t )data_len) {
 		if (savederrno == EMSGSIZE) {
 			dst_link->last_bad_mtu = onwire_len;
+
+			log_debug(knet_h, KNET_SUB_PMTUD, "CC: EMSGSIZE for %u low_mtu=%d, high_mtu=%d, last_good = %d", (int)onwire_len, (int)low_mtu, (int)high_mtu, (int)dst_link->last_good_mtu);
+
+			high_mtu = onwire_len;
+
+			onwire_len -= (onwire_len - low_mtu)/2;
+
+			/* Might be off-by-one and rounding will make us loop forever! */
+			if (abs(high_mtu - low_mtu) < 2) {
+
+				onwire_len = dst_link->last_good_mtu;
+				/*
+				 * account for IP overhead, knet headers and crypto in PMTU calculation
+				 */
+				dst_link->status.mtu = onwire_len - dst_link->status.proto_overhead;
+				pthread_mutex_unlock(&knet_h->pmtud_mutex);
+				return 0;
+			}
+
+			pthread_mutex_unlock(&knet_h->pmtud_mutex);
+			goto restart;
 		} else {
 			log_debug(knet_h, KNET_SUB_PMTUD, "Unable to send pmtu packet len: %zu err: %s", onwire_len, strerror(savederrno));
 		}
@@ -203,7 +234,7 @@ retry:
 		 *       the public API exports milliseconds. So careful with the 0's here.
 		 * the loop is necessary because we are grabbing the current time just above
 		 * and add values to it that could overflow into seconds.
-		 */ 
+		 */
 
 		ts.tv_sec += dst_link->pong_timeout_adj / 1000000;
 		ts.tv_nsec += (((dst_link->pong_timeout_adj) % 1000000) * 1000);
@@ -229,38 +260,22 @@ retry:
 			mutex_retry_limit++;
 			goto restart;
 		}
-
-		if ((dst_link->last_recv_mtu != onwire_len) || (ret)) {
-			dst_link->last_bad_mtu = onwire_len;
-		} else {
-			int found_mtu = 0;
-
-			if (knet_h->sec_block_size) {
-				if ((onwire_len + knet_h->sec_block_size >= max_mtu_len) ||
-				   ((dst_link->last_bad_mtu) && (dst_link->last_bad_mtu <= (onwire_len + knet_h->sec_block_size)))) {
-					found_mtu = 1;
-				}
-			} else {
-				if ((onwire_len == max_mtu_len) ||
-				    ((dst_link->last_bad_mtu) && (dst_link->last_bad_mtu == (onwire_len + 1)))) {
-					found_mtu = 1;
-				}
-			}
-
-			if (found_mtu) {
-				/*
-				 * account for IP overhead, knet headers and crypto in PMTU calculation
-				 */
-				dst_link->status.mtu = onwire_len - dst_link->status.proto_overhead;
-				pthread_mutex_unlock(&knet_h->pmtud_mutex);
-				return 0;
-			}
-
-			dst_link->last_good_mtu = onwire_len;
-		}
 	}
 
-	onwire_len = (dst_link->last_good_mtu + dst_link->last_bad_mtu) / 2;
+	log_debug(knet_h, KNET_SUB_PMTUD, "CC: success for %u low_mtu=%d, high_mtu=%d, last_good = %d", (int)onwire_len, (int)low_mtu, (int)high_mtu, (int)dst_link->last_good_mtu);
+
+	dst_link->last_good_mtu = onwire_len;
+
+	/* Might be off-by-one and rounding will make us loop forever! */
+	if (abs(high_mtu - low_mtu) < 2) {
+		dst_link->status.mtu = onwire_len - dst_link->status.proto_overhead;
+		pthread_mutex_unlock(&knet_h->pmtud_mutex);
+		return 0;
+	}
+
+	low_mtu = onwire_len;
+	onwire_len += (high_mtu - onwire_len)/2;
+
 	pthread_mutex_unlock(&knet_h->pmtud_mutex);
 
 	goto restart;
