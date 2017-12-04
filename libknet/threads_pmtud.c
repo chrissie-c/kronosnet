@@ -70,6 +70,7 @@ static int _handle_check_link_pmtud(knet_handle_t knet_h, struct knet_host *dst_
 
 	low_mtu = 0;
 	high_mtu = max_mtu_len;
+	dst_link->last_bad_mtu = 0;
 
 	if (dst_link->has_valid_mtu && dst_link->status.mtu) {
 		onwire_len = dst_link->status.mtu + dst_link->status.proto_overhead;
