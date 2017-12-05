@@ -39,6 +39,7 @@ static int _handle_check_link_pmtud(knet_handle_t knet_h, struct knet_host *dst_
 	struct timespec ts;
 	unsigned char *outbuf = (unsigned char *)knet_h->pmtudbuf;
 	size_t low_mtu, high_mtu;
+	size_t last_onwire_len;
 
 	mutex_retry_limit = 0;
 	failsafe = 0;
@@ -68,8 +69,9 @@ static int _handle_check_link_pmtud(knet_handle_t knet_h, struct knet_host *dst_
 	 * Binary chops until we reach a usable number
 	 */
 
-	low_mtu = 0;
+	low_mtu = 576;
 	high_mtu = max_mtu_len;
+	last_onwire_len = 0;
 	dst_link->last_bad_mtu = 0;
 
 	if (dst_link->has_valid_mtu && dst_link->status.mtu) {
@@ -119,10 +121,8 @@ restart:
 			}
 		}
 
-		if (dst_link->last_bad_mtu) {
-			while (data_len + overhead_len >= dst_link->last_bad_mtu) {
-				data_len = data_len - (knet_h->sec_hash_size + knet_h->sec_salt_size + knet_h->sec_block_size);
-			}
+		while (data_len + overhead_len > onwire_len) {
+			data_len = data_len - (knet_h->sec_hash_size + knet_h->sec_salt_size + knet_h->sec_block_size);
 		}
 
 		if (data_len < (knet_h->sec_hash_size + knet_h->sec_salt_size + knet_h->sec_block_size) + 1) {
@@ -130,8 +130,9 @@ restart:
 			return -1;
 		}
 
-//		onwire_len = data_len + overhead_len;
+		onwire_len = data_len + overhead_len;
 		knet_h->pmtudbuf->khp_pmtud_size = onwire_len;
+		log_debug(knet_h, KNET_SUB_PMTUD, "CC: onwire_len is now %u (data_len = %d, crypto overhead %d), last bad MTU=%d", (int)onwire_len, (int)data_len, (int)overhead_len, (int)dst_link->last_bad_mtu);
 
 		if (crypto_encrypt_and_sign(knet_h,
 					    (const unsigned char *)knet_h->pmtudbuf,
@@ -172,6 +173,7 @@ retry:
 			MSG_DONTWAIT | MSG_NOSIGNAL, (struct sockaddr *) &dst_link->dst_addr,
 			sizeof(struct sockaddr_storage));
 	savederrno = errno;
+	log_debug(knet_h, KNET_SUB_PMTUD, "CC: sendto for %u returned %d (%d %s)", (int)data_len, (int)len, savederrno, len!=-1?"":strerror(savederrno));
 
 	err = transport_tx_sock_error(knet_h, dst_link->transport_type, dst_link->outsock, len, savederrno);
 	switch(err) {
@@ -192,14 +194,10 @@ retry:
 		if (savederrno == EMSGSIZE) {
 			dst_link->last_bad_mtu = onwire_len;
 
-			log_debug(knet_h, KNET_SUB_PMTUD, "CC: EMSGSIZE for %u low_mtu=%d, high_mtu=%d, last_good = %d", (int)onwire_len, (int)low_mtu, (int)high_mtu, (int)dst_link->last_good_mtu);
+			log_debug(knet_h, KNET_SUB_PMTUD, "CC: EMSGSIZE for %u (data_len=%d), low_mtu=%d, high_mtu=%d, last_good = %d", (int)onwire_len, (int)data_len, (int)low_mtu, (int)high_mtu, (int)dst_link->last_good_mtu);
 
-			high_mtu = onwire_len;
-
-			onwire_len -= (onwire_len - low_mtu)/2;
-
-			/* Might be off-by-one and rounding will make us loop forever! */
-			if (abs(high_mtu - low_mtu) < 2) {
+			/* Have we been here before? */
+			if (onwire_len == last_onwire_len) {
 
 				onwire_len = dst_link->last_good_mtu;
 				/*
@@ -209,7 +207,11 @@ retry:
 				pthread_mutex_unlock(&knet_h->pmtud_mutex);
 				return 0;
 			}
+			high_mtu = onwire_len;
+			last_onwire_len = onwire_len;
+			onwire_len -= (onwire_len - low_mtu)/2;
 
+			log_debug(knet_h, KNET_SUB_PMTUD, "CC: The new onwire_len is %d", (int)onwire_len);
 			pthread_mutex_unlock(&knet_h->pmtud_mutex);
 			goto restart;
 		} else {
@@ -267,15 +269,18 @@ retry:
 
 	dst_link->last_good_mtu = onwire_len;
 
-	/* Might be off-by-one and rounding will make us loop forever! */
-	if (abs(high_mtu - low_mtu) < 2) {
+	/* Have we been here before? */
+	if (onwire_len == last_onwire_len) {
 		dst_link->status.mtu = onwire_len - dst_link->status.proto_overhead;
 		pthread_mutex_unlock(&knet_h->pmtud_mutex);
 		return 0;
 	}
 
 	low_mtu = onwire_len;
+	last_onwire_len = onwire_len;
 	onwire_len += (high_mtu - onwire_len)/2;
+
+	log_debug(knet_h, KNET_SUB_PMTUD, "CC: the new onwire_len is %d, overhead_len=%d", (int)onwire_len, (int)overhead_len);
 
 	pthread_mutex_unlock(&knet_h->pmtud_mutex);
 
