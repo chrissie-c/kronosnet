@@ -23,11 +23,25 @@ static int print_man = 0;
 static char *man_section="3";
 static char *package_name="Kronosnet";
 static char *footer="Kronosnet Programmer's Manual";
-static char *output_dir="";
+static char *output_dir="./";
 static qb_map_t *params_map;
 static qb_map_t *function_map;
 
+struct param_info {
+	char *paramname;
+	char *paramtype;
+	char *paramdesc;
+};
+
 static char *get_texttree(int *type, xmlNode *cur_node, char **returntext);
+
+static void free_paraminfo(struct param_info *pi)
+{
+	free(pi->paramname);
+	free(pi->paramtype);
+	free(pi->paramdesc);
+	free(pi);
+}
 
 static char *get_attr(xmlNode *node, const char *tag)
 {
@@ -67,6 +81,33 @@ int not_all_whitespace(char *string)
 	return 0;
 }
 
+void get_param_info(xmlNode *cur_node)
+{
+	xmlNode *this_tag;
+	xmlNode *sub_tag;
+	char *paramname = NULL;
+	char *paramdesc = NULL;
+	struct param_info *pi;
+
+	/* FIXME this is not fun, and very inflexible */
+	for (this_tag = cur_node->children; this_tag; this_tag = this_tag->next) {
+		for (sub_tag = this_tag->children; sub_tag; sub_tag = sub_tag->next) {
+			if (sub_tag->type == XML_ELEMENT_NODE && strcmp((char *)sub_tag->name, "parameternamelist") == 0) {
+				paramname = (char*)sub_tag->children->next->children->content;
+			}
+			if (sub_tag->type == XML_ELEMENT_NODE && strcmp((char *)sub_tag->name, "parameterdescription") == 0) {
+				paramdesc = (char*)sub_tag->children->next->children->content;
+
+				/* Add text to the param_map */
+				pi = qb_map_get(params_map, paramname);
+				if (pi) {
+					pi->paramdesc = paramdesc;
+				}
+			}
+		}
+	}
+}
+
 char *get_text(xmlNode *cur_node, char **returntext)
 {
 	xmlNode *this_tag;
@@ -92,6 +133,10 @@ char *get_text(xmlNode *cur_node, char **returntext)
 				*returntext = tmp;
 			}
 		}
+
+		if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "parameterlist") == 0) {
+			get_param_info(this_tag);
+		}
 	}
 	return strdup(buffer);
 }
@@ -111,7 +156,7 @@ char *get_texttree(int *type, xmlNode *cur_node, char **returntext)
 			strcat(buffer, "\n");
 			free(tmp);
 		}
-
+#if 0
 		// PARAMs ??? CC is this right??x
 		if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "type") == 0 &&
 			this_tag->children->content) {
@@ -123,7 +168,9 @@ char *get_texttree(int *type, xmlNode *cur_node, char **returntext)
 			*type = TAG_TYPE_DECLNAME;
 			tmp = strdup((char*)this_tag->children->content);
 		}
+#endif
 	}
+
 	if (buffer[0]) {
 		tmp = strdup(buffer);
 	}
@@ -133,7 +180,7 @@ char *get_texttree(int *type, xmlNode *cur_node, char **returntext)
 
 static void print_text(char *name, char *def, char *brief, char *args, char *detailed, qb_map_t *param_map, char *returntext)
 {
-	printf(" ------------------ Header --------------------\n");
+	printf(" ------------------ %s --------------------\n", name);
 	printf("NAME\n");
 	printf("        %s - %s", name, brief);
 
@@ -165,6 +212,7 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 	int max_param_len;
 	int param_count;
 	int param_num;
+	struct param_info *pi;
 
 	t = time(NULL);
 	tm = localtime(&t);
@@ -179,7 +227,7 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 	if (!manfile) {
 		perror("unable to open output file"); // TODO Better handling
 		printf("%s", manfilename); // TODO Better handling
-		return;
+		exit(1);
 	}
 
 	fprintf(manfile, ".\\\"  Automatically generated man page, do not edit\n");
@@ -197,8 +245,10 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 	max_param_len = 0;
 	iter = qb_map_iter_create(param_map);
 	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
-		if (strlen(p) > max_param_len) {
-			max_param_len = strlen(p);
+		pi = data;
+
+		if (strlen(pi->paramtype) > max_param_len) {
+			max_param_len = strlen(pi->paramtype);
 		}
 		param_count++;
 	}
@@ -206,9 +256,12 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 
 	iter = qb_map_iter_create(param_map);
 	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
-		fprintf(manfile, "    \\fB%-*s \\fP\\fI%s\\fP%s\n", max_param_len, p, (char*) data,
+		pi = data;
+
+		fprintf(manfile, "    \\fB%-*s \\fP\\fI%s\\fP%s\n", max_param_len, pi->paramtype, p,
 			param_num++ < param_count?",":"");
 		qb_map_rm(param_map, p);
+		free_paraminfo(pi);
 	}
 	qb_map_iter_free(iter);
 
@@ -281,10 +334,17 @@ void traverse_members(xmlNode *cur_node)
 			if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "detaileddescription") == 0) {
 				detailed = get_texttree(&type, this_tag, &returntext);
 			}
+			/* Get all the params */
 			if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "param") == 0) {
 				char *param_type = get_child(this_tag, "type");
 				char *param_name = get_child(this_tag, "declname");
-				qb_map_put(params_map, param_name, param_type);
+				struct param_info *pi = malloc(sizeof(struct param_info));
+				if (pi) {
+					pi->paramname = param_name;
+					pi->paramtype = param_type;
+					pi->paramdesc = NULL;
+					qb_map_put(params_map, param_name, pi);
+				}
 			}
 		}
 
@@ -317,7 +377,6 @@ void traverse_node(xmlNode *parentnode, char *leafname)
 	xmlNode *cur_node;
 
 	for (cur_node = parentnode->children; cur_node; cur_node = cur_node->next) {
-//		fprintf(stderr, "Node: %s\n",(char *)cur_node->name);
 
 		if (cur_node->type == XML_ELEMENT_NODE && cur_node->name
 		    && strcmp((char*)cur_node->name, leafname)==0) {
@@ -330,6 +389,20 @@ void traverse_node(xmlNode *parentnode, char *leafname)
 	}
 }
 
+
+static void usage(char *name)
+{
+	printf("Usage:\n");
+	printf("      %s -[am] [-s <section>] [-p<packagename>] [-f <footer>] [-o <output dir>] [XML file]\n", name);
+	printf("\n");
+	printf("       -a            Print ASCII dump of man pages to stdout\n");
+	printf("       -n            Write man page files to <output dir>\n");
+	printf("       -s <s>        Write man pages into section <s> <default 3)\n");
+	printf("       -p <package>  Use <package> name. default <Kronosnet>\n");
+	printf("       -f <footer>   Set Footer (default \"Kronosnet Programmer's Manual\"\n");
+	printf("       -o <dir>      Write all man pages to <dir> (default .)\n");
+	printf("       -h            Print this usage text\n");
+}
 
 int main(int argc, char *argv[])
 {
@@ -364,8 +437,8 @@ int main(int argc, char *argv[])
 				break;
 			case '?':
 			case 'h':
-				//usage();
-				break;
+				usage(argv[0]);
+				return 0;
 		}
 	}
 
