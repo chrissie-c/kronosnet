@@ -20,11 +20,14 @@
 
 static int print_ascii = 1;
 static int print_man = 0;
+static int print_params = 0;
+static int num_functions = 0;
 static char *man_section="3";
 static char *package_name="Kronosnet";
-static char *footer="Kronosnet Programmer's Manual";
+static char *header="Kronosnet Programmer's Manual";
 static char *output_dir="./";
 static qb_map_t *params_map;
+static qb_map_t *retval_map;
 static qb_map_t *function_map;
 
 struct param_info {
@@ -81,7 +84,7 @@ int not_all_whitespace(char *string)
 	return 0;
 }
 
-void get_param_info(xmlNode *cur_node)
+void get_param_info(xmlNode *cur_node, qb_map_t *map)
 {
 	xmlNode *this_tag;
 	xmlNode *sub_tag;
@@ -99,9 +102,18 @@ void get_param_info(xmlNode *cur_node)
 				paramdesc = (char*)sub_tag->children->next->children->content;
 
 				/* Add text to the param_map */
-				pi = qb_map_get(params_map, paramname);
+				pi = qb_map_get(map, paramname);
 				if (pi) {
 					pi->paramdesc = paramdesc;
+				}
+				else {
+					pi = malloc(sizeof(struct param_info));
+					if (pi) {
+						pi->paramname = paramname;
+						pi->paramdesc = paramdesc;
+						pi->paramtype = NULL; /* probably retval */
+						qb_map_put(map, paramname, pi);
+					}
 				}
 			}
 		}
@@ -111,6 +123,7 @@ void get_param_info(xmlNode *cur_node)
 char *get_text(xmlNode *cur_node, char **returntext)
 {
 	xmlNode *this_tag;
+	xmlNode *sub_tag;
 	char *kind;
 	char buffer[4096] = {'\0'};
 
@@ -119,6 +132,23 @@ char *get_text(xmlNode *cur_node, char **returntext)
 			if (not_all_whitespace((char*)this_tag->content)) {
 				strcat(buffer, (char*)this_tag->content);
 				strcat(buffer, "\n");
+			}
+		}
+		if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "emphasis") == 0) {
+			if (print_man) {
+				strcat(buffer, "\\fB");
+			}
+			strcat(buffer, (char*)this_tag->children->content);
+			if (print_man) {
+				strcat(buffer, "\\fR");
+			}
+		}
+		if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "itemizedlist") == 0) {
+			for (sub_tag = this_tag->children; sub_tag; sub_tag = sub_tag->next) {
+				if (sub_tag->type == XML_ELEMENT_NODE && strcmp((char *)sub_tag->name, "listitem") == 0) {
+					strcat(buffer, (char*)sub_tag->children->children->content);
+					strcat(buffer, "\n");
+				}
 			}
 		}
 
@@ -135,7 +165,13 @@ char *get_text(xmlNode *cur_node, char **returntext)
 		}
 
 		if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "parameterlist") == 0) {
-			get_param_info(this_tag);
+			kind = get_attr(this_tag, "kind");
+			if (strcmp(kind, "param") == 0) {
+				get_param_info(this_tag, params_map);
+			}
+			if (strcmp(kind, "retval") == 0) {
+				get_param_info(this_tag, retval_map);
+			}
 		}
 	}
 	return strdup(buffer);
@@ -156,19 +192,6 @@ char *get_texttree(int *type, xmlNode *cur_node, char **returntext)
 			strcat(buffer, "\n");
 			free(tmp);
 		}
-#if 0
-		// PARAMs ??? CC is this right??x
-		if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "type") == 0 &&
-			this_tag->children->content) {
-			*type = TAG_TYPE_TYPE;
-			tmp = strdup((char*)this_tag->children->content);
-		}
-		if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "declname") == 0 &&
-		    this_tag->children->content) {
-			*type = TAG_TYPE_DECLNAME;
-			tmp = strdup((char*)this_tag->children->content);
-		}
-#endif
 	}
 
 	if (buffer[0]) {
@@ -194,9 +217,21 @@ static void print_text(char *name, char *def, char *brief, char *args, char *det
 	printf("        %s\n", returntext);
 }
 
+/* Print a long string with para marks in it. */
 static void man_print_long_string(FILE *manfile, char *text)
 {
-	fprintf(manfile, text);// TODO
+	char *next_nl;
+	char *current = text;
+
+	next_nl = strchr(text, '\n');
+	while (next_nl && *next_nl != '\0') {
+		*next_nl = '\0';
+		fprintf(manfile, "%s\n.PP\n", current);
+
+		*next_nl = '\n';
+		current = next_nl+1;
+		next_nl = strchr(current, '\n');
+	}
 }
 
 static void print_manpage(char *name, char *def, char *brief, char *args, char *detailed, qb_map_t *param_map, char *returntext)
@@ -209,7 +244,9 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 	qb_map_iter_t *iter;
 	const char *p;
 	void *data;
-	int max_param_len;
+	int max_param_type_len;
+	int max_param_name_len;
+	int num_param_descs;
 	int param_count;
 	int param_num;
 	struct param_info *pi;
@@ -230,8 +267,31 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 		exit(1);
 	}
 
+	/* Work out the length of the parameters, so we can line them up   */
+	max_param_type_len = 0;
+	max_param_name_len = 0;
+	num_param_descs = 0;
+	iter = qb_map_iter_create(param_map);
+	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+		pi = data;
+
+		if (strlen(pi->paramtype) > max_param_type_len) {
+			max_param_type_len = strlen(pi->paramtype);
+		}
+		if (strlen(pi->paramname) > max_param_name_len) {
+			max_param_name_len = strlen(pi->paramname);
+		}
+		if (pi->paramdesc) {
+			num_param_descs++;
+		}
+		param_count++;
+	}
+	qb_map_iter_free(iter);
+
+	/* Off we go */
+
 	fprintf(manfile, ".\\\"  Automatically generated man page, do not edit\n");
-	fprintf(manfile, ".TH %s %s %s \"%s\" \"%s\"\n", name, man_section, gendate, package_name, footer);
+	fprintf(manfile, ".TH %s %s %s \"%s\" \"%s\"\n", name, man_section, gendate, package_name, header);
 
 	fprintf(manfile, ".SH \"NAME\"\n");
 	fprintf(manfile, "%s \\- %s\n", name, brief);
@@ -242,61 +302,114 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 	fprintf(manfile, ".sp\n");
 	fprintf(manfile, "\\fB%s\\fP(\n", def);
 
-	max_param_len = 0;
 	iter = qb_map_iter_create(param_map);
 	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
 		pi = data;
 
-		if (strlen(pi->paramtype) > max_param_len) {
-			max_param_len = strlen(pi->paramtype);
-		}
-		param_count++;
-	}
-	qb_map_iter_free(iter);
-
-	iter = qb_map_iter_create(param_map);
-	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
-		pi = data;
-
-		fprintf(manfile, "    \\fB%-*s \\fP\\fI%s\\fP%s\n", max_param_len, pi->paramtype, p,
+		fprintf(manfile, "    \\fB%-*s \\fP\\fI%s\\fP%s\n", max_param_type_len, pi->paramtype, p,
 			param_num++ < param_count?",":"");
-		qb_map_rm(param_map, p);
-		free_paraminfo(pi);
 	}
 	qb_map_iter_free(iter);
 
 	fprintf(manfile, ");\n");
 	fprintf(manfile, ".fi\n");
 
+	if (print_params && num_param_descs) {
+		fprintf(manfile, ".SH \"PARAMS\"\n");
+		iter = qb_map_iter_create(param_map);
+		for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+			pi = data;
+
+			fprintf(manfile, "\\fB%-*s \\fP\\fI%s\\fP\n", max_param_name_len, pi->paramname,
+				pi->paramdesc);
+			fprintf(manfile, ".PP\n");
+		}
+		qb_map_iter_free(iter);
+	}
+
 	fprintf(manfile, ".SH \"DESCRIPTION\"\n");
 	man_print_long_string(manfile, detailed);
 
 	fprintf(manfile, ".SH \"RETURN VALUE\"\n");
 	man_print_long_string(manfile, returntext);
+	fprintf(manfile, ".PP\n");
 
-#if 0
+	iter = qb_map_iter_create(retval_map);
+	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+		pi = data;
+
+		fprintf(manfile, "\\fB%-*s \\fP\\fI%s\\fP\n", 10, pi->paramname,
+			pi->paramdesc);
+		fprintf(manfile, ".PP\n");
+	}
+	qb_map_iter_free(iter);
+
 	fprintf(manfile, ".SH \"SEE ALSO\"\n");
 	fprintf(manfile, ".PP\n");
 	fprintf(manfile, ".nh\n");
 	fprintf(manfile, ".ad l\n");
 
-	/* This is no use as we print the functions as we gather them!! */
 	iter = qb_map_iter_create(function_map);
 	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
-		fprintf(manfile, "\\fI%s(%s)%s", (char *)data, man_section,
-			param_num++ < param_count?", ":"");
-		qb_map_rm(param_map, p);
+
+		/* Exclude us! */
+		if (strcmp(data, name)) {
+			fprintf(manfile, "\\fI%s(%s)%s", (char *)data, man_section,
+				param_num++ <= (num_functions)?", ":"");
+		}
 	}
 	qb_map_iter_free(iter);
-#endif
 
+	fprintf(manfile, "\n");
 	fprintf(manfile, ".ad\n");
 	fprintf(manfile, ".hy\n");
 	fprintf(manfile, ".SH \"COPYRIGHT\"\n");
 	fprintf(manfile, ".PP\n");
 	fprintf(manfile, "Copyright (C) 2010-%4d Red Hat, Inc. All rights reserved\n", tm->tm_year+1900);
 	fclose(manfile);
+
+	/* Free the params info */
+	iter = qb_map_iter_create(param_map);
+	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+		pi = data;
+		qb_map_rm(param_map, p);
+		free_paraminfo(pi);
+	}
+	qb_map_iter_free(iter);
+
+	iter = qb_map_iter_create(retval_map);
+	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+		pi = data;
+		qb_map_rm(retval_map, p);
+		free_paraminfo(pi);
+	}
+	qb_map_iter_free(iter);
 }
+
+/* Same as traverse_members, but to collect function names */
+void collect_functions(xmlNode *cur_node)
+{
+	xmlNode *this_tag;
+	char *kind;
+	char *name;
+
+	if (cur_node->name && strcmp((char *)cur_node->name, "memberdef") == 0) {
+
+		kind = get_attr(cur_node, "kind");
+		if (kind && strcmp(kind, "function") == 0) {
+
+			for (this_tag = cur_node->children; this_tag; this_tag = this_tag->next) {
+				if (this_tag->type == XML_ELEMENT_NODE && strcmp((char *)this_tag->name, "name") == 0) {
+					name = strdup((char *)this_tag->children->content);
+				}
+			}
+
+			qb_map_put(function_map, name, name);
+			num_functions++;
+		}
+	}
+}
+
 
 void traverse_members(xmlNode *cur_node)
 {
@@ -353,8 +466,6 @@ void traverse_members(xmlNode *cur_node)
 		}
 
 		if (kind && strcmp(kind, "function") == 0) {
-
-			qb_map_put(function_map, man_section, name);
 			if (print_man) {
 				print_manpage(name, def, brief, args, detailed, params_map, returntext);
 			}
@@ -372,7 +483,7 @@ void traverse_members(xmlNode *cur_node)
 }
 
 
-void traverse_node(xmlNode *parentnode, char *leafname)
+void traverse_node(xmlNode *parentnode, char *leafname, void (do_members(xmlNode*)))
 {
 	xmlNode *cur_node;
 
@@ -380,11 +491,11 @@ void traverse_node(xmlNode *parentnode, char *leafname)
 
 		if (cur_node->type == XML_ELEMENT_NODE && cur_node->name
 		    && strcmp((char*)cur_node->name, leafname)==0) {
-			traverse_members(cur_node);
+			do_members(cur_node);
 			continue;
 		}
 		if (cur_node->type == XML_ELEMENT_NODE) {
-			traverse_node(cur_node, leafname);
+			traverse_node(cur_node, leafname, do_members);
 		}
 	}
 }
@@ -393,25 +504,26 @@ void traverse_node(xmlNode *parentnode, char *leafname)
 static void usage(char *name)
 {
 	printf("Usage:\n");
-	printf("      %s -[am] [-s <section>] [-p<packagename>] [-f <footer>] [-o <output dir>] [XML file]\n", name);
+	printf("      %s -[am] [-s <section>] [-p<packagename>] [-H <header>] [-o <output dir>] [XML file]\n", name);
 	printf("\n");
 	printf("       -a            Print ASCII dump of man pages to stdout\n");
 	printf("       -n            Write man page files to <output dir>\n");
+	printf("       -P            Print PARAMS section\n");
 	printf("       -s <s>        Write man pages into section <s> <default 3)\n");
 	printf("       -p <package>  Use <package> name. default <Kronosnet>\n");
-	printf("       -f <footer>   Set Footer (default \"Kronosnet Programmer's Manual\"\n");
+	printf("       -H <header>   Set header (default \"Kronosnet Programmer's Manual\"\n");
 	printf("       -o <dir>      Write all man pages to <dir> (default .)\n");
 	printf("       -h            Print this usage text\n");
 }
 
 int main(int argc, char *argv[])
 {
-	xmlNode *tweets;
+	xmlNode *rootdoc;
 	xmlDocPtr doc;
 	int quiet=0;
 	int opt;
 
-	while ( (opt = getopt_long(argc, argv, "ams:o:p:f:h?", NULL, NULL)) != EOF)
+	while ( (opt = getopt_long(argc, argv, "amPs:o:p:f:h?", NULL, NULL)) != EOF)
 	{
 		switch(opt)
 		{
@@ -423,14 +535,17 @@ int main(int argc, char *argv[])
 				print_man = 1;
 				print_ascii = 0;
 				break;
+			case 'P':
+				print_params = 1;
+				break;
 			case 's':
 				man_section = optarg;
 				break;
 			case 'p':
 				package_name = optarg;
 				break;
-			case 'f':
-				footer = optarg;
+			case 'H':
+				header = optarg;
 				break;
 			case 'o':
 				output_dir = optarg;
@@ -452,8 +567,8 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	tweets = xmlDocGetRootElement(doc);
-	if (!tweets) {
+	rootdoc = xmlDocGetRootElement(doc);
+	if (!rootdoc) {
 		fprintf(stderr, "Can't find \"document root\"\n");
 		exit(1);
 	}
@@ -461,8 +576,14 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "done.\n");
 
 	params_map = qb_hashtable_create(10);
+	retval_map = qb_hashtable_create(10);
 	function_map = qb_hashtable_create(100);
-	traverse_node(tweets, "memberdef");
+
+	/* Collect functions */
+	traverse_node(rootdoc, "memberdef", collect_functions);
+
+	/* print pages */
+	traverse_node(rootdoc, "memberdef", traverse_members);
 
 	return 0;
 }
