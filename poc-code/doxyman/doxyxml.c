@@ -61,13 +61,23 @@ static char *get_attr(xmlNode *node, const char *tag)
 static char *get_child(xmlNode *node, const char *tag)
 {
 	xmlNode *this_node;
+	xmlNode *child;
+	char buffer[1024] = {'\0'};
 
 	for (this_node = node->children; this_node; this_node = this_node->next) {
-		if (this_node->type == XML_ELEMENT_NODE && this_node->children && strcmp((char *)this_node->name, tag) == 0) {
-			return strdup((char *)this_node->children->content);
+
+		if ((this_node->type == XML_ELEMENT_NODE && this_node->children) && ((strcmp((char *)this_node->name, tag) == 0))) {			for (child = this_node->children; child; child = child->next) {
+				if (child->content) strcat(buffer,(char *)child->content);
+
+				if ((strcmp( (char*)child->name, "ref") == 0)) {
+					if (child->children->content) {
+						strcat(buffer,(char *)child->children->content);
+					}
+				}
+			}
 		}
 	}
-	return NULL;
+	return strdup(buffer);
 }
 
 int not_all_whitespace(char *string)
