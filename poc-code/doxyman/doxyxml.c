@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2018 Red Hat, Inc.  All rights reserved.
+ *
+ * Author: Christine Caulfield <ccaulfie@redhat.com>
+ *
+ * This software licensed under GPL-2.0+, LGPL-2.0+
+ */
+
+
+/*
+ * NOTE: this code is very rough, it does the bare minimum to parse the
+ * XML out from doxygen and is probably very fragile to changes in that XML
+ * schema. It probably leaks memory all over the place too.
+ *
+ * In its favour, it *does* generate man pages and should only be run very ocasionally
+ */
+
 #define _XOPEN_SOURCE
 #define _BSD_SOURCE
 #define _XOPEN_SOURCE_EXTENDED
@@ -22,6 +39,8 @@ static char *man_section="3";
 static char *package_name="Kronosnet";
 static char *header="Kronosnet Programmer's Manual";
 static char *output_dir="./";
+static char *xml_dir = XML_DIR;
+static char *xml_file = "/libknet_8h.xml";
 static qb_map_t *params_map;
 static qb_map_t *retval_map;
 static qb_map_t *function_map;
@@ -230,7 +249,7 @@ static void read_struct(xmlNode *cur_node, void *arg)
 
 	pi = malloc(sizeof(struct param_info));
 	if (pi) {
-		sprintf(fullname, "%s%s", name, args);
+		snprintf(fullname, sizeof(fullname), "%s%s", name, args);
 		pi->paramtype = strdup(type);
 		pi->paramname = strdup(fullname);
 		pi->paramdesc = NULL;
@@ -246,7 +265,7 @@ static int read_structure_from_xml(char *refid, char *name)
 	struct struct_info *si;
 	int ret = -1;
 
-	sprintf(fname, XML_DIR "/%s.xml", refid);
+	snprintf(fname, sizeof(fname), XML_DIR "/%s.xml", refid);
 
 	doc = xmlParseFile(fname);
 	if (doc == NULL) {
@@ -335,6 +354,7 @@ char *get_texttree(int *type, xmlNode *cur_node, char **returntext)
 	return tmp;
 }
 
+/* The text output is VERY basic and just a check that it's working really */
 static void print_text(char *name, char *def, char *brief, char *args, char *detailed, qb_map_t *param_map, char *returntext)
 {
 	printf(" ------------------ %s --------------------\n", name);
@@ -678,6 +698,7 @@ static void usage(char *name)
 	printf("       -p <package>  Use <package> name. default <Kronosnet>\n");
 	printf("       -H <header>   Set header (default \"Kronosnet Programmer's Manual\"\n");
 	printf("       -o <dir>      Write all man pages to <dir> (default .)\n");
+	printf("       -d <dir>      Directory for XML files\n");
 	printf("       -h            Print this usage text\n");
 }
 
@@ -687,8 +708,9 @@ int main(int argc, char *argv[])
 	xmlDocPtr doc;
 	int quiet=0;
 	int opt;
+	char xml_filename[PATH_MAX];
 
-	while ( (opt = getopt_long(argc, argv, "amPs:o:p:f:h?", NULL, NULL)) != EOF)
+	while ( (opt = getopt_long(argc, argv, "amPs:d:o:p:f:h?", NULL, NULL)) != EOF)
 	{
 		switch(opt)
 		{
@@ -706,6 +728,9 @@ int main(int argc, char *argv[])
 			case 's':
 				man_section = optarg;
 				break;
+			case 'd':
+				xml_dir = optarg;
+				break;
 			case 'p':
 				package_name = optarg;
 				break;
@@ -722,13 +747,17 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (argv[optind]) {
+		xml_file = argv[optind];
+	}
 	if (!quiet) {
 		fprintf(stderr, "reading xml ... ");
 	}
 
-	doc = xmlParseFile(XML_DIR "/libknet_8h.xml");
+	snprintf(xml_filename, sizeof(xml_filename), "%s/%s", xml_dir, xml_file);
+	doc = xmlParseFile(xml_filename);
 	if (doc == NULL) {
-		fprintf(stderr, "Error: unable to parse xml file\n");
+		fprintf(stderr, "Error: unable to read xml file %s\n", xml_filename);
 		exit(1);
 	}
 
