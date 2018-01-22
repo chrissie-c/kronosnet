@@ -12,11 +12,7 @@
 #include <libxml/tree.h>
 #include <qb/qbmap.h>
 
-#define TAG_TYPE_PARA       1
-#define TAG_TYPE_TEXT       2
-#define TAG_TYPE_TYPE       3
-#define TAG_TYPE_SIMPLESECT 4
-#define TAG_TYPE_DECLNAME   5
+#define XML_DIR "../../libknet/man/xml"
 
 static int print_ascii = 1;
 static int print_man = 0;
@@ -29,14 +25,23 @@ static char *output_dir="./";
 static qb_map_t *params_map;
 static qb_map_t *retval_map;
 static qb_map_t *function_map;
+static qb_map_t *structures_map;
+static qb_map_t *used_structures_map;
 
 struct param_info {
 	char *paramname;
 	char *paramtype;
 	char *paramdesc;
+	struct param_info *next;
+};
+
+struct struct_info {
+	char *structname;
+	qb_map_t *params_map;
 };
 
 static char *get_texttree(int *type, xmlNode *cur_node, char **returntext);
+static void traverse_node(xmlNode *parentnode, char *leafname, void (do_members(xmlNode*, void*)), void *arg);
 
 static void free_paraminfo(struct param_info *pi)
 {
@@ -63,18 +68,31 @@ static char *get_child(xmlNode *node, const char *tag)
 	xmlNode *this_node;
 	xmlNode *child;
 	char buffer[1024] = {'\0'};
+	char *refid;
+	char *declname = NULL;
 
 	for (this_node = node->children; this_node; this_node = this_node->next) {
+		if ((strcmp( (char*)this_node->name, "declname") == 0)) {
+			declname = strdup((char*)this_node->children->content);
+		}
 
-		if ((this_node->type == XML_ELEMENT_NODE && this_node->children) && ((strcmp((char *)this_node->name, tag) == 0))) {			for (child = this_node->children; child; child = child->next) {
-				if (child->content) strcat(buffer,(char *)child->content);
+		if ((this_node->type == XML_ELEMENT_NODE && this_node->children) && ((strcmp((char *)this_node->name, tag) == 0))) {
+			refid = NULL;
+			for (child = this_node->children; child; child = child->next) {
+				if (child->content) {
+					strcat(buffer, (char *)child->content);
+				}
 
 				if ((strcmp( (char*)child->name, "ref") == 0)) {
 					if (child->children->content) {
 						strcat(buffer,(char *)child->children->content);
 					}
+					refid = get_attr(child, "refid");
 				}
 			}
+		}
+		if (declname && refid) {
+			qb_map_put(used_structures_map, refid, declname);
 		}
 	}
 	return strdup(buffer);
@@ -102,7 +120,7 @@ void get_param_info(xmlNode *cur_node, qb_map_t *map)
 	char *paramdesc = NULL;
 	struct param_info *pi;
 
-	/* FIXME this is not fun, and very inflexible */
+	/* This is not robust, and very inflexible */
 	for (this_tag = cur_node->children; this_tag; this_tag = this_tag->next) {
 		for (sub_tag = this_tag->children; sub_tag; sub_tag = sub_tag->next) {
 			if (sub_tag->type == XML_ELEMENT_NODE && strcmp((char *)sub_tag->name, "parameternamelist") == 0) {
@@ -187,6 +205,112 @@ char *get_text(xmlNode *cur_node, char **returntext)
 	return strdup(buffer);
 }
 
+/* Called from traverse_node() */
+static void read_struct(xmlNode *cur_node, void *arg)
+{
+	xmlNode *this_tag;
+	struct struct_info *si=arg;
+	struct param_info *pi;
+	char fullname[1024];
+	char *type;
+	char *name;
+	char *args="";
+
+	for (this_tag = cur_node->children; this_tag; this_tag = this_tag->next) {
+		if (strcmp((char*)this_tag->name, "type") == 0) {
+			type = (char*)this_tag->children->content ;
+		}
+		if (strcmp((char*)this_tag->name, "name") == 0) {
+			name = (char*)this_tag->children->content ;
+		}
+		if (this_tag->children && strcmp((char*)this_tag->name, "argsstring") == 0) {
+			args = (char*)this_tag->children->content;
+		}
+	}
+
+	pi = malloc(sizeof(struct param_info));
+	if (pi) {
+		sprintf(fullname, "%s%s", name, args);
+		pi->paramtype = strdup(type);
+		pi->paramname = strdup(fullname);
+		pi->paramdesc = NULL;
+		qb_map_put(si->params_map, name, pi);
+	}
+}
+
+static int read_structure_from_xml(char *refid, char *name)
+{
+	char fname[PATH_MAX];
+	xmlNode *rootdoc;
+	xmlDocPtr doc;
+	struct struct_info *si;
+	int ret = -1;
+
+	sprintf(fname, XML_DIR "/%s.xml", refid);
+
+	doc = xmlParseFile(fname);
+	if (doc == NULL) {
+		fprintf(stderr, "Error: unable to open xml file for %s\n", refid);
+		return -1;
+	}
+
+	rootdoc = xmlDocGetRootElement(doc);
+	if (!rootdoc) {
+		fprintf(stderr, "Can't find \"document root\"\n");
+		return -1;
+	}
+
+	si = malloc(sizeof(struct struct_info));
+	if (si) {
+		si->params_map = qb_hashtable_create(10);
+		si->structname = strdup(name);
+		traverse_node(rootdoc, "memberdef", read_struct, si);
+		ret = 0;
+		qb_map_put(structures_map, refid, si);
+	}
+	xmlFreeDoc(doc);
+
+	return ret;
+}
+
+static void print_structure(FILE *manfile, char *refid, char *name)
+{
+	struct struct_info *si;
+	struct param_info *pi;
+	qb_map_iter_t *iter;
+	const char *p;
+	void *data;
+	int max_param_length=0;
+
+	/* If it's not been read in - go and look for it */
+	si = qb_map_get(structures_map, refid);
+	if (!si) {
+		if (!read_structure_from_xml(refid, name)) {
+			si = qb_map_get(structures_map, refid);
+		}
+	}
+
+	if (si) {
+		iter = qb_map_iter_create(si->params_map);
+		for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+			pi = data;
+			if (strlen(pi->paramtype) > max_param_length) {
+				max_param_length = strlen(pi->paramtype);
+			}
+		}
+		qb_map_iter_free(iter);
+
+		fprintf(manfile, "struct %s {\n", si->structname);
+
+		iter = qb_map_iter_create(si->params_map);
+		for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+			pi = data;
+			fprintf(manfile, "   %-*s \\fI%s\\fP;\n", max_param_length, pi->paramtype, pi->paramname);
+		}
+		qb_map_iter_free(iter);
+		fprintf(manfile, "};\n");
+	}
+}
 
 char *get_texttree(int *type, xmlNode *cur_node, char **returntext)
 {
@@ -340,6 +464,30 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 	fprintf(manfile, ".SH \"DESCRIPTION\"\n");
 	man_print_long_string(manfile, detailed);
 
+	if (qb_map_count_get(used_structures_map)) {
+		fprintf(manfile, ".SH \"STRUCTURES\"\n");
+
+
+		iter = qb_map_iter_create(used_structures_map);
+		for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+			fprintf(manfile, ".SS \"\"\n");
+			fprintf(manfile, ".PP\n");
+			fprintf(manfile, ".sp\n");
+			fprintf(manfile, ".sp\n");
+			fprintf(manfile, ".RS\n");
+			fprintf(manfile, ".nf\n");
+			fprintf(manfile, "\\fB\n");
+
+			print_structure(manfile, (char*)p, (char *)data);
+
+			fprintf(manfile, "\\fP\n");
+			fprintf(manfile, ".fi\n");
+		}
+		qb_map_iter_free(iter);
+
+		fprintf(manfile, ".RE\n");
+	}
+
 	fprintf(manfile, ".SH \"RETURN VALUE\"\n");
 	man_print_long_string(manfile, returntext);
 	fprintf(manfile, ".PP\n");
@@ -394,10 +542,17 @@ static void print_manpage(char *name, char *def, char *brief, char *args, char *
 		free_paraminfo(pi);
 	}
 	qb_map_iter_free(iter);
+
+	/* Free used-structures map */
+	iter = qb_map_iter_create(used_structures_map);
+	for (p = qb_map_iter_next(iter, &data); p; p = qb_map_iter_next(iter, &data)) {
+		qb_map_rm(used_structures_map, p);
+		free(data);
+	}
 }
 
 /* Same as traverse_members, but to collect function names */
-void collect_functions(xmlNode *cur_node)
+void collect_functions(xmlNode *cur_node, void *arg)
 {
 	xmlNode *this_tag;
 	char *kind;
@@ -421,7 +576,7 @@ void collect_functions(xmlNode *cur_node)
 }
 
 
-void traverse_members(xmlNode *cur_node)
+void traverse_members(xmlNode *cur_node, void *arg)
 {
 	xmlNode *this_tag;
 
@@ -493,7 +648,7 @@ void traverse_members(xmlNode *cur_node)
 }
 
 
-void traverse_node(xmlNode *parentnode, char *leafname, void (do_members(xmlNode*)))
+static void traverse_node(xmlNode *parentnode, char *leafname, void (do_members(xmlNode*, void*)), void *arg)
 {
 	xmlNode *cur_node;
 
@@ -501,11 +656,11 @@ void traverse_node(xmlNode *parentnode, char *leafname, void (do_members(xmlNode
 
 		if (cur_node->type == XML_ELEMENT_NODE && cur_node->name
 		    && strcmp((char*)cur_node->name, leafname)==0) {
-			do_members(cur_node);
+			do_members(cur_node, arg);
 			continue;
 		}
 		if (cur_node->type == XML_ELEMENT_NODE) {
-			traverse_node(cur_node, leafname, do_members);
+			traverse_node(cur_node, leafname, do_members, arg);
 		}
 	}
 }
@@ -571,7 +726,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "reading xml ... ");
 	}
 
-	doc = xmlParseFile("../../libknet/man/xml/libknet_8h.xml");
+	doc = xmlParseFile(XML_DIR "/libknet_8h.xml");
 	if (doc == NULL) {
 		fprintf(stderr, "Error: unable to parse xml file\n");
 		exit(1);
@@ -587,13 +742,15 @@ int main(int argc, char *argv[])
 
 	params_map = qb_hashtable_create(10);
 	retval_map = qb_hashtable_create(10);
+	used_structures_map = qb_hashtable_create(10);
+	structures_map = qb_hashtable_create(50);
 	function_map = qb_hashtable_create(100);
 
 	/* Collect functions */
-	traverse_node(rootdoc, "memberdef", collect_functions);
+	traverse_node(rootdoc, "memberdef", collect_functions, NULL);
 
 	/* print pages */
-	traverse_node(rootdoc, "memberdef", traverse_members);
+	traverse_node(rootdoc, "memberdef", traverse_members, NULL);
 
 	return 0;
 }
