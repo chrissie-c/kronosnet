@@ -18,6 +18,7 @@
 #include "libknet.h"
 #include "onwire.h"
 #include "compat.h"
+#include "threads_common.h"
 
 #define KNET_DATABUFSIZE KNET_MAX_PACKET_SIZE + KNET_HEADER_ALL_SIZE
 
@@ -174,12 +175,13 @@ struct knet_handle {
 	struct knet_header *recv_from_links_buf[PCKT_RX_BUFS];
 	struct knet_header *pingbuf;
 	struct knet_header *pmtudbuf;
+	uint8_t threads_status[KNET_THREAD_MAX];
+	pthread_mutex_t threads_status_mutex;
 	pthread_t send_to_links_thread;
 	pthread_t recv_from_links_thread;
 	pthread_t heartbt_thread;
 	pthread_t dst_link_handler_thread;
 	pthread_t pmtud_link_handler_thread;
-	int lock_init_done;
 	pthread_rwlock_t global_rwlock;		/* global config lock */
 	pthread_mutex_t pmtud_mutex;		/* pmtud mutex to handle conditional send/recv + timeout */
 	pthread_cond_t pmtud_cond;		/* conditional for above */
@@ -334,6 +336,11 @@ typedef struct knet_transport_ops {
 } knet_transport_ops_t;
 
 socklen_t sockaddr_len(const struct sockaddr_storage *ss);
+
+struct pretty_names {
+	const char *name;
+	uint8_t val;
+};
 
 /**
  * This is a kernel style list implementation.
