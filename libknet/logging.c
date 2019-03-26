@@ -20,11 +20,6 @@
 #include "logging.h"
 #include "threads_common.h"
 
-struct pretty_names {
-	const char *name;
-	uint8_t val;
-};
-
 static struct pretty_names subsystem_names[] =
 {
 	{ "common", KNET_SUB_COMMON },
@@ -64,6 +59,7 @@ const char *knet_log_get_subsystem_name(uint8_t subsystem)
 			break;
 		}
 		if (subsystem_names[i].val == subsystem) {
+			errno = 0;
 			return subsystem_names[i].name;
 		}
 	}
@@ -79,6 +75,7 @@ uint8_t knet_log_get_subsystem_id(const char *name)
 			break;
 		}
 		if (strcasecmp(name, subsystem_names[i].name) == 0) {
+			errno = 0;
 			return subsystem_names[i].val;
 		}
 	}
@@ -115,6 +112,7 @@ const char *knet_log_get_loglevel_name(uint8_t level)
 
 	for (i = 0; i <= KNET_LOG_DEBUG; i++) {
 		if (loglevel_names[i].val == level) {
+			errno = 0;
 			return loglevel_names[i].name;
 		}
 	}
@@ -127,6 +125,7 @@ uint8_t knet_log_get_loglevel_id(const char *name)
 
 	for (i = 0; i <= KNET_LOG_DEBUG; i++) {
 		if (strcasecmp(name, loglevel_names[i].name) == 0) {
+			errno = 0;
 			return loglevel_names[i].val;
 		}
 	}
@@ -164,6 +163,7 @@ int knet_log_set_loglevel(knet_handle_t knet_h, uint8_t subsystem,
 	knet_h->log_levels[subsystem] = level;
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
+	errno = 0;
 	return 0;
 }
 
@@ -198,6 +198,7 @@ int knet_log_get_loglevel(knet_handle_t knet_h, uint8_t subsystem,
 	*level = knet_h->log_levels[subsystem];
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
+	errno = 0;
 	return 0;
 }
 
@@ -207,58 +208,41 @@ void log_msg(knet_handle_t knet_h, uint8_t subsystem, uint8_t msglevel,
 	va_list ap;
 	struct knet_log_msg msg;
 	size_t byte_cnt = 0;
-	int len, err;
+	int len;
 
 	if ((!knet_h) ||
 	    (subsystem == KNET_MAX_SUBSYSTEMS) ||
 	    (msglevel > knet_h->log_levels[subsystem]))
 			return;
 
-	/*
-	 * most logging calls will take place with locking in place.
-	 * if we get an EINVAL and locking is initialized, then
-	 * we are getting a real error and we need to stop
-	 */
-	err = pthread_rwlock_tryrdlock(&knet_h->global_rwlock);
-	if ((err == EAGAIN) && (knet_h->lock_init_done))
-		return;
-
 	if (knet_h->logfd <= 0)
-		goto out_unlock;
+		goto out;
 
 	memset(&msg, 0, sizeof(struct knet_log_msg));
 	msg.subsystem = subsystem;
 	msg.msglevel = msglevel;
+	msg.knet_h = knet_h;
 
 	va_start(ap, fmt);
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wformat-nonliteral"
 #endif
-	vsnprintf(msg.msg, sizeof(msg.msg) - 2, fmt, ap);
+	vsnprintf(msg.msg, sizeof(msg.msg), fmt, ap);
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
 	va_end(ap);
 
-	len = strlen(msg.msg);
-	msg.msg[len+1] = '\n';
-
 	while (byte_cnt < sizeof(struct knet_log_msg)) {
 		len = write(knet_h->logfd, &msg, sizeof(struct knet_log_msg) - byte_cnt);
 		if (len <= 0) {
-			goto out_unlock;
+			goto out;
 		}
 
 		byte_cnt += len;
 	}
 
-out_unlock:
-	/*
-	 * unlock only if we are holding the lock
-	 */
-	if (!err)
-		pthread_rwlock_unlock(&knet_h->global_rwlock);
-
+out:
 	return;
 }

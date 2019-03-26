@@ -18,6 +18,7 @@
 #include "libknet.h"
 #include "onwire.h"
 #include "compat.h"
+#include "threads_common.h"
 
 #define KNET_DATABUFSIZE KNET_MAX_PACKET_SIZE + KNET_HEADER_ALL_SIZE
 
@@ -61,7 +62,7 @@ struct knet_link {
 	struct knet_link_status status;
 	/* internals */
 	uint8_t link_id;
-	uint8_t transport_type;                 /* #defined constant from API */
+	uint8_t transport;                      /* #defined constant from API */
 	knet_transport_link_t transport_link;   /* link_info_t from transport */
 	int outsock;
 	unsigned int configured:1;		/* set to 1 if src/dst have been configured transport initialized on this link*/
@@ -129,10 +130,11 @@ struct knet_sock {
 };
 
 struct knet_fd_trackers {
-	uint8_t transport; /* transport type (UDP/SCTP...) */
-	uint8_t data_type; /* internal use for transport to define what data are associated
-			    * to this fd */
-	void *data;	   /* pointer to the data */
+	uint8_t transport;		    /* transport type (UDP/SCTP...) */
+	uint8_t data_type;		    /* internal use for transport to define what data are associated
+					     * with this fd */
+	void *data;			    /* pointer to the data */
+	void *access_list_match_entry_head; /* pointer to access list match_entry list head */
 };
 
 #define KNET_MAX_FDS KNET_MAX_HOST * KNET_MAX_LINK * 4
@@ -157,6 +159,7 @@ struct knet_handle {
 	int send_to_links_epollfd;
 	int recv_from_links_epollfd;
 	int dst_link_handler_epollfd;
+	uint8_t use_access_lists; /* set to 0 for disable, 1 for enable */
 	unsigned int pmtud_interval;
 	unsigned int data_mtu;	/* contains the max data size that we can send onwire
 				 * without frags */
@@ -174,12 +177,14 @@ struct knet_handle {
 	struct knet_header *recv_from_links_buf[PCKT_RX_BUFS];
 	struct knet_header *pingbuf;
 	struct knet_header *pmtudbuf;
+	uint8_t threads_status[KNET_THREAD_MAX];
+	useconds_t threads_timer_res;
+	pthread_mutex_t threads_status_mutex;
 	pthread_t send_to_links_thread;
 	pthread_t recv_from_links_thread;
 	pthread_t heartbt_thread;
 	pthread_t dst_link_handler_thread;
 	pthread_t pmtud_link_handler_thread;
-	int lock_init_done;
 	pthread_rwlock_t global_rwlock;		/* global config lock */
 	pthread_mutex_t pmtud_mutex;		/* pmtud mutex to handle conditional send/recv + timeout */
 	pthread_cond_t pmtud_cond;		/* conditional for above */
@@ -234,6 +239,14 @@ struct knet_handle {
 		uint8_t reachable,
 		uint8_t remote,
 		uint8_t external);
+	void *link_status_change_notify_fn_private_data;
+	void (*link_status_change_notify_fn) (
+		void *private_data,
+		knet_node_id_t host_id,
+		uint8_t link_id,
+		uint8_t connected,
+		uint8_t remote,
+		uint8_t external);
 	void *sock_notify_fn_private_data;
 	void (*sock_notify_fn) (
 		void *private_data,
@@ -253,6 +266,38 @@ extern pthread_rwlock_t shlib_rwlock;       /* global shared lib load lock */
  *       for every protocol.
  */
 
+/*
+ * for now knet supports only IP protocols (udp/sctp)
+ * in future there might be others like ARP
+ * or TIPC.
+ * keep this around as transport information
+ * to use for access lists and other operations
+ */
+
+#define TRANSPORT_PROTO_LOOPBACK 0
+#define TRANSPORT_PROTO_IP_PROTO 1
+
+/*
+ * some transports like SCTP can filter incoming
+ * connections before knet has to process
+ * any packets.
+ * GENERIC_ACL -> packet has to be read and filterted
+ * PROTO_ACL -> transport provides filtering at lower levels
+ *              and packet does not need to be processed
+ */
+
+typedef enum {
+	USE_NO_ACL,
+	USE_GENERIC_ACL,
+	USE_PROTO_ACL
+} transport_acl;
+
+/*
+ * make it easier to map values in transports.c
+ */
+#define TRANSPORT_PROTO_NOT_CONNECTION_ORIENTED 0
+#define TRANSPORT_PROTO_IS_CONNECTION_ORIENTED  1
+
 typedef struct knet_transport_ops {
 /*
  * transport generic information
@@ -260,6 +305,16 @@ typedef struct knet_transport_ops {
 	const char *transport_name;
 	const uint8_t transport_id;
 	const uint8_t built_in;
+
+	uint8_t transport_protocol;
+	transport_acl transport_acl_type;
+
+/*
+ * connection oriented protocols like SCTP
+ * don´t need dst_addr in sendto calls and
+ * on some OSes are considered EINVAL.
+ */
+	uint8_t transport_is_connection_oriented;
 
 	uint32_t transport_mtu_overhead;
 /*
@@ -291,6 +346,12 @@ typedef struct knet_transport_ops {
  * this is called in global read lock context
  */
 	int (*transport_link_dyn_connect)(knet_handle_t knet_h, int sockfd, struct knet_link *link);
+
+
+/*
+ * return the fd to use for access lists
+ */
+	int (*transport_link_get_acl_fd)(knet_handle_t knet_h, struct knet_link *link);
 
 /*
  * per transport error handling of recvmmsg
@@ -334,6 +395,11 @@ typedef struct knet_transport_ops {
 } knet_transport_ops_t;
 
 socklen_t sockaddr_len(const struct sockaddr_storage *ss);
+
+struct pretty_names {
+	const char *name;
+	uint8_t val;
+};
 
 /**
  * This is a kernel style list implementation.

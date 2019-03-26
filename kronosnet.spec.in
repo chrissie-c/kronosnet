@@ -25,11 +25,12 @@
 %@lzma@ lzma
 %@bzip2@ bzip2
 %@kronosnetd@ kronosnetd
-%@libtap@ libtap
+%@libnozzle@ libnozzle
 %@runautogen@ runautogen
 %@rpmdebuginfo@ rpmdebuginfo
 %@overriderpmdebuginfo@ overriderpmdebuginfo
 %@buildman@ buildman
+%@installtests@ installtests
 
 %if %{with overriderpmdebuginfo}
 %undefine _enable_debug_packages
@@ -59,11 +60,11 @@
 %if %{with bzip2}
 %global buildcompressbzip2 1
 %endif
-%if %{with libtap}
-%global buildlibtap 1
+%if %{with libnozzle}
+%global buildlibnozzle 1
 %endif
 %if %{with kronosnetd}
-%global buildlibtap 1
+%global buildlibnozzle 1
 %global buildkronosnetd 1
 %endif
 %if %{with runautogen}
@@ -71,6 +72,9 @@
 %endif
 %if %{with buildman}
 %global buildmanpages 1
+%endif
+%if %{with installtests}
+%global installtestsuite 1
 %endif
 
 # main (empty) package
@@ -122,6 +126,9 @@ BuildRequires: /usr/include/bzlib.h
 %if %{defined buildkronosnetd}
 BuildRequires: pam-devel
 %endif
+%if %{defined buildlibnozzle}
+BuildRequires: libnl3-devel
+%endif
 %if %{defined buildautogen}
 BuildRequires: autoconf
 BuildRequires: automake
@@ -137,6 +144,11 @@ BuildRequires: libtool
 %endif
 
 %{configure} \
+%if %{defined installtestsuite}
+	--enable-install-tests \
+%else
+	--disable-install-tests \
+%endif
 %if %{defined buildmanpages}
 	--enable-man \
 %else
@@ -185,8 +197,8 @@ BuildRequires: libtool
 %if %{defined buildkronosnetd}
 	--enable-kronosnetd \
 %endif
-%if %{defined buildlibtap}
-	--enable-libtap \
+%if %{defined buildlibnozzle}
+	--enable-libnozzle \
 %endif
 	--with-initdefaultdir=%{_sysconfdir}/sysconfig/ \
 %if %{defined _unitdir}
@@ -301,42 +313,43 @@ fi
 %{_mandir}/man8/*
 %endif
 
-%if %{defined buildlibtap}
-%package -n libtap1
+%if %{defined buildlibnozzle}
+%package -n libnozzle1
 Group: System Environment/Libraries
 Summary: Simple userland wrapper around kernel tap devices
 
-%description -n libtap1
+%description -n libnozzle1
  This is an over-engineered commodity library to manage a pool
  of tap devices and provides the basic
  pre-up.d/up.d/down.d/post-down.d infrastructure.
 
-%files -n libtap1
+%files -n libnozzle1
 %defattr(-,root,root,-)
 %doc COPYING.* COPYRIGHT
-%{_libdir}/libtap.so.*
+%{_libdir}/libnozzle.so.*
 
-%post -n libtap1 -p /sbin/ldconfig
+%post -n libnozzle1 -p /sbin/ldconfig
 
-%postun -n libtap1 -p /sbin/ldconfig
+%postun -n libnozzle1 -p /sbin/ldconfig
 
-%package -n libtap1-devel
+%package -n libnozzle1-devel
 Group: Development/Libraries
 Summary: Simple userland wrapper around kernel tap devices (developer files)
-Requires: libtap1 = %{version}-%{release}
+Requires: libnozzle1 = %{version}-%{release}
 Requires: pkgconfig
 
-%description -n libtap1-devel
+%description -n libnozzle1-devel
  This is an over-engineered commodity library to manage a pool
  of tap devices and provides the basic
  pre-up.d/up.d/down.d/post-down.d infrastructure.
 
-%files -n libtap1-devel
+%files -n libnozzle1-devel
 %defattr(-,root,root,-)
 %doc COPYING.* COPYRIGHT
-%{_libdir}/libtap.so
-%{_includedir}/libtap.h
-%{_libdir}/pkgconfig/libtap.pc
+%{_libdir}/libnozzle.so
+%{_includedir}/libnozzle.h
+%{_libdir}/pkgconfig/libnozzle.pc
+%{_mandir}/man3/nozzle*.3.gz
 %endif
 
 %package -n libknet1
@@ -526,6 +539,20 @@ Requires: libknet1-crypto-plugins-all
  meta package to install all of libknet1 plugins
 
 %files -n libknet1-plugins-all
+
+%if %{with installtests}
+%package -n kronosnet-tests
+Group: System Environment/Libraries
+Summary: kronosnet test suite
+Requires: libknet1 = %{version}-%{release}
+
+%description -n kronosnet-tests
+ this package contains all the libknet and libnozzle test suite
+
+%files -n kronosnet-tests
+%defattr(-,root,root,-)
+%{_libdir}/kronosnet/tests/*
+%endif
 
 %if %{with rpmdebuginfo}
 %debug_package

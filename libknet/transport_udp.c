@@ -186,8 +186,7 @@ int udp_transport_link_clear_config(knet_handle_t knet_h, struct knet_link *kn_l
 			if (&host->link[link_idx] == kn_link)
 				continue;
 
-			if ((host->link[link_idx].transport_link == info) &&
-			    (host->link[link_idx].status.enabled == 1)) {
+			if (host->link[link_idx].transport_link == info) {
 				found = 1;
 				break;
 			}
@@ -401,14 +400,14 @@ int udp_transport_tx_sock_error(knet_handle_t knet_h, int sockfd, int recv_err, 
 			read_errs_from_sock(knet_h, sockfd);
 			return 0;
 		}
-		if (recv_errno == EINVAL) {
+		if (recv_errno == EINVAL || recv_errno == EPERM) {
 			return -1;
 		}
 		if ((recv_errno == ENOBUFS) || (recv_errno == EAGAIN)) {
 #ifdef DEBUG
 			log_debug(knet_h, KNET_SUB_TRANSP_UDP, "Sock: %d is overloaded. Slowing TX down", sockfd);
 #endif
-			usleep(KNET_THREADS_TIMERES / 16);
+			usleep(knet_h->threads_timer_res / 16);
 		} else {
 			read_errs_from_sock(knet_h, sockfd);
 		}
@@ -430,4 +429,9 @@ int udp_transport_link_dyn_connect(knet_handle_t knet_h, int sockfd, struct knet
 {
 	kn_link->status.dynconnected = 1;
 	return 0;
+}
+
+int udp_transport_link_get_acl_fd(knet_handle_t knet_h, struct knet_link *kn_link)
+{
+	return kn_link->outsock;
 }

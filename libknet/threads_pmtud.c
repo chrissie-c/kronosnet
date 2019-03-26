@@ -172,9 +172,12 @@ restart:
 		return -1;
 	}
 retry:
-	len = sendto(dst_link->outsock, outbuf, data_len,
-			MSG_DONTWAIT | MSG_NOSIGNAL, (struct sockaddr *) &dst_link->dst_addr,
-			sizeof(struct sockaddr_storage));
+	if (transport_get_connection_oriented(knet_h, dst_link->transport) == TRANSPORT_PROTO_NOT_CONNECTION_ORIENTED) {
+		len = sendto(dst_link->outsock, outbuf, data_len, MSG_DONTWAIT | MSG_NOSIGNAL,
+			     (struct sockaddr *) &dst_link->dst_addr, sizeof(struct sockaddr_storage));
+	} else {
+		len = sendto(dst_link->outsock, outbuf, data_len, MSG_DONTWAIT | MSG_NOSIGNAL, NULL, 0);
+	}
 	savederrno = errno;
 
 	/*
@@ -193,7 +196,7 @@ retry:
 
 	kernel_mtu = 0;
 
-	err = transport_tx_sock_error(knet_h, dst_link->transport_type, dst_link->outsock, len, savederrno);
+	err = transport_tx_sock_error(knet_h, dst_link->transport, dst_link->outsock, len, savederrno);
 	switch(err) {
 		case -1: /* unrecoverable error */
 			log_debug(knet_h, KNET_SUB_PMTUD, "Unable to send pmtu packet (sendto): %d %s", savederrno, strerror(savederrno));
@@ -479,6 +482,8 @@ void *_handle_pmtud_link_thread(void *data)
 	int link_has_mtu;
 	int force_run = 0;
 
+	set_thread_status(knet_h, KNET_THREAD_PMTUD, KNET_THREAD_STARTED);
+
 	knet_h->data_mtu = KNET_PMTUD_MIN_MTU_V4 - KNET_HEADER_ALL_SIZE - knet_h->sec_header_size;
 
 	/* preparing pmtu buffer */
@@ -487,7 +492,7 @@ void *_handle_pmtud_link_thread(void *data)
 	knet_h->pmtudbuf->kh_node = htons(knet_h->host_id);
 
 	while (!shutdown_in_progress(knet_h)) {
-		usleep(KNET_THREADS_TIMERES);
+		usleep(knet_h->threads_timer_res);
 
 		if (pthread_mutex_lock(&knet_h->pmtud_mutex) != 0) {
 			log_debug(knet_h, KNET_SUB_PMTUD, "Unable to get mutex lock");
@@ -518,7 +523,7 @@ void *_handle_pmtud_link_thread(void *data)
 
 				if ((dst_link->status.enabled != 1) ||
 				    (dst_link->status.connected != 1) ||
-				    (dst_host->link[link_idx].transport_type == KNET_TRANSPORT_LOOPBACK) ||
+				    (dst_host->link[link_idx].transport == KNET_TRANSPORT_LOOPBACK) ||
 				    (!dst_link->last_ping_size) ||
 				    ((dst_link->dynamic == KNET_LINK_DYNIP) &&
 				     (dst_link->status.dynconnected != 1)))
@@ -557,6 +562,8 @@ out_unlock:
 			pthread_mutex_unlock(&knet_h->pmtud_mutex);
 		}
 	}
+
+	set_thread_status(knet_h, KNET_THREAD_PMTUD, KNET_THREAD_STOPPED);
 
 	return NULL;
 }

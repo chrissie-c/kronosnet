@@ -20,20 +20,40 @@
 #include "transports.h"
 #include "host.h"
 #include "threads_common.h"
+#include "links_acl.h"
 
 int _link_updown(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
 		 unsigned int enabled, unsigned int connected)
 {
-	struct knet_link *link = &knet_h->host_index[host_id]->link[link_id];
+	struct knet_host *host = knet_h->host_index[host_id];
+	struct knet_link *link = &host->link[link_id];
+	int notify_status = link->status.connected;
 
 	if ((link->status.enabled == enabled) &&
 	    (link->status.connected == connected))
 		return 0;
 
+	if ((link->status.enabled) &&
+	    (knet_h->link_status_change_notify_fn)) {
+		if (link->status.connected != connected) {
+			notify_status = connected; /* connection state */
+		}
+		if (!enabled) {
+			notify_status = 0; /* disable == disconnected */
+		}
+		knet_h->link_status_change_notify_fn(
+					knet_h->link_status_change_notify_fn_private_data,
+					host_id,
+					link_id,
+					notify_status,
+					host->status.remote,
+					host->status.external);
+	}
+
 	link->status.enabled = enabled;
 	link->status.connected = connected;
 
-	_host_dstcache_update_async(knet_h, knet_h->host_index[host_id]);
+	_host_dstcache_update_async(knet_h, host);
 
 	if ((link->status.dynconnected) &&
 	    (!link->status.connected))
@@ -228,6 +248,26 @@ int knet_link_set_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 		err = -1;
 		goto exit_unlock;
 	}
+
+	/*
+	 * we can only configure default access lists if we know both endpoints
+	 * and the protocol uses GENERIC_ACL, otherwise the protocol has
+	 * to setup their own access lists above in transport_link_set_config.
+	 */
+	if ((transport_get_acl_type(knet_h, transport) == USE_GENERIC_ACL) &&
+	    (link->dynamic == KNET_LINK_STATIC)) {
+		log_debug(knet_h, KNET_SUB_LINK, "Configuring default access lists for host: %u link: %u socket: %d",
+			  host_id, link_id, link->outsock);
+		if ((check_add(knet_h, link->outsock, transport, -1,
+			       &link->dst_addr, &link->dst_addr,
+			       CHECK_TYPE_ADDRESS, CHECK_ACCEPT) < 0) && (errno != EEXIST)) {
+			log_warn(knet_h, KNET_SUB_LINK, "Failed to configure default access lists for host: %u link: %u", host_id, link_id);
+			savederrno = errno;
+			err = -1;
+			goto exit_unlock;
+		}
+	}
+
 	link->configured = 1;
 	log_debug(knet_h, KNET_SUB_LINK, "host: %u link: %u is configured",
 		  host_id, link_id);
@@ -244,7 +284,7 @@ int knet_link_set_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -324,7 +364,7 @@ int knet_link_get_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 
 	memmove(src_addr, &link->src_addr, sizeof(struct sockaddr_storage));
 
-	*transport = link->transport_type;
+	*transport = link->transport;
 	*flags = link->flags;
 
 	if (link->dynamic == KNET_LINK_STATIC) {
@@ -336,7 +376,7 @@ int knet_link_get_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -345,6 +385,8 @@ int knet_link_clear_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t
 	int savederrno = 0, err = 0;
 	struct knet_host *host;
 	struct knet_link *link;
+	int sock;
+	uint8_t transport;
 
 	if (!knet_h) {
 		errno = EINVAL;
@@ -391,6 +433,32 @@ int knet_link_clear_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t
 		goto exit_unlock;
 	}
 
+	/*
+	 * remove well known access lists here.
+	 * After the transport has done clearing the config,
+	 * then we can remove any leftover access lists if the link
+	 * is no longer in use.
+	 */
+	if ((transport_get_acl_type(knet_h, link->transport) == USE_GENERIC_ACL) &&
+	    (link->dynamic == KNET_LINK_STATIC)) {
+		if ((check_rm(knet_h, link->outsock, link->transport,
+			      &link->dst_addr, &link->dst_addr,
+			      CHECK_TYPE_ADDRESS, CHECK_ACCEPT) < 0) && (errno != ENOENT)) {
+			err = -1;
+			savederrno = errno;
+			log_err(knet_h, KNET_SUB_LINK, "Host %u link %u: unable to remove default access list",
+				host_id, link_id);
+			goto exit_unlock;
+		}
+	}
+
+	/*
+	 * cache it for later as we don't know if the transport
+	 * will clear link info during clear_config.
+	 */
+	sock = link->outsock;
+	transport = link->transport;
+
 	if ((transport_link_clear_config(knet_h, link) < 0)  &&
 	    (errno != EBUSY)) {
 		savederrno = errno;
@@ -398,10 +466,19 @@ int knet_link_clear_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t
 		goto exit_unlock;
 	}
 
+	/*
+	 * remove any other access lists when the socket is no
+	 * longer in use by the transport.
+	 */
+	if ((transport_get_acl_type(knet_h, link->transport) == USE_GENERIC_ACL) &&
+	    (knet_h->knet_transport_fd_tracker[sock].transport == KNET_MAX_TRANSPORTS)) {
+		check_rmall(knet_h, sock, transport);
+	}
+
 	memset(link, 0, sizeof(struct knet_link));
 	link->link_id = link_id;
 
-	if (knet_h->has_loop_link && link_id == knet_h->loop_link) {
+	if (knet_h->has_loop_link && host_id == knet_h->host_id && link_id == knet_h->loop_link) {
 		knet_h->has_loop_link = 0;
 		if (host->active_link_entries == 0) {
 			host->status.reachable = 0;
@@ -413,7 +490,7 @@ int knet_link_clear_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -483,7 +560,7 @@ int knet_link_set_enable(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -540,7 +617,7 @@ int knet_link_get_enable(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -601,7 +678,7 @@ int knet_link_set_pong_count(knet_handle_t knet_h, knet_node_id_t host_id, uint8
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -658,7 +735,7 @@ int knet_link_get_pong_count(knet_handle_t knet_h, knet_node_id_t host_id, uint8
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -733,7 +810,7 @@ int knet_link_set_ping_timers(knet_handle_t knet_h, knet_node_id_t host_id, uint
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -802,7 +879,7 @@ int knet_link_get_ping_timers(knet_handle_t knet_h, knet_node_id_t host_id, uint
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -876,7 +953,7 @@ int knet_link_set_priority(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -933,7 +1010,7 @@ int knet_link_get_priority(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -989,7 +1066,7 @@ int knet_link_get_link_list(knet_handle_t knet_h, knet_node_id_t host_id,
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1081,6 +1158,388 @@ int knet_link_get_status(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
+	errno = err ? savederrno : 0;
+	return err;
+}
+
+int knet_link_enable_status_change_notify(knet_handle_t knet_h,
+					  void *link_status_change_notify_fn_private_data,
+					  void (*link_status_change_notify_fn) (
+						void *private_data,
+						knet_node_id_t host_id,
+						uint8_t link_id,
+						uint8_t connected,
+						uint8_t remote,
+						uint8_t external))
+{
+	int savederrno = 0;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = get_global_wrlock(knet_h);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_LINK, "Unable to get write lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	knet_h->link_status_change_notify_fn_private_data = link_status_change_notify_fn_private_data;
+	knet_h->link_status_change_notify_fn = link_status_change_notify_fn;
+	if (knet_h->link_status_change_notify_fn) {
+		log_debug(knet_h, KNET_SUB_LINK, "link_status_change_notify_fn enabled");
+	} else {
+		log_debug(knet_h, KNET_SUB_LINK, "link_status_change_notify_fn disabled");
+	}
+
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+
+	errno = 0;
+	return 0;
+}
+
+int knet_link_add_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
+		      struct sockaddr_storage *ss1,
+		      struct sockaddr_storage *ss2,
+		      check_type_t type, check_acceptreject_t acceptreject)
+{
+	int savederrno = 0, err = 0;
+	struct knet_host *host;
+	struct knet_link *link;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (!ss1) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type != CHECK_TYPE_ADDRESS) &&
+	    (type != CHECK_TYPE_MASK) &&
+	    (type != CHECK_TYPE_RANGE)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((acceptreject != CHECK_ACCEPT) &&
+	    (acceptreject != CHECK_REJECT)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type != CHECK_TYPE_ADDRESS) && (!ss2)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type == CHECK_TYPE_RANGE) &&
+	    (ss1->ss_family != ss2->ss_family)) {
+			errno = EINVAL;
+			return -1;
+	}
+
+	if (link_id >= KNET_MAX_LINK) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = get_global_wrlock(knet_h);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_LINK, "Unable to get write lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	host = knet_h->host_index[host_id];
+	if (!host) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "Unable to find host %u: %s",
+			host_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	link = &host->link[link_id];
+
+	if (!link->configured) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is not configured: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	if (link->dynamic != KNET_LINK_DYNIP) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is a point to point connection: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	err = check_add(knet_h, transport_link_get_acl_fd(knet_h, link), link->transport, -1,
+			ss1, ss2, type, acceptreject);
+	savederrno = errno;
+
+exit_unlock:
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+
+	errno = savederrno;
+	return err;
+}
+
+int knet_link_insert_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
+			 int index,
+			 struct sockaddr_storage *ss1,
+			 struct sockaddr_storage *ss2,
+			 check_type_t type, check_acceptreject_t acceptreject)
+{
+	int savederrno = 0, err = 0;
+	struct knet_host *host;
+	struct knet_link *link;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (!ss1) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type != CHECK_TYPE_ADDRESS) &&
+	    (type != CHECK_TYPE_MASK) &&
+	    (type != CHECK_TYPE_RANGE)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((acceptreject != CHECK_ACCEPT) &&
+	    (acceptreject != CHECK_REJECT)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type != CHECK_TYPE_ADDRESS) && (!ss2)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type == CHECK_TYPE_RANGE) &&
+	    (ss1->ss_family != ss2->ss_family)) {
+			errno = EINVAL;
+			return -1;
+	}
+
+	if (link_id >= KNET_MAX_LINK) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = get_global_wrlock(knet_h);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_LINK, "Unable to get write lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	host = knet_h->host_index[host_id];
+	if (!host) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "Unable to find host %u: %s",
+			host_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	link = &host->link[link_id];
+
+	if (!link->configured) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is not configured: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	if (link->dynamic != KNET_LINK_DYNIP) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is a point to point connection: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	err = check_add(knet_h, transport_link_get_acl_fd(knet_h, link), link->transport, index,
+			ss1, ss2, type, acceptreject);
+	savederrno = errno;
+
+exit_unlock:
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+
+	errno = savederrno;
+	return err;
+}
+
+int knet_link_rm_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
+		     struct sockaddr_storage *ss1,
+		     struct sockaddr_storage *ss2,
+		     check_type_t type, check_acceptreject_t acceptreject)
+{
+	int savederrno = 0, err = 0;
+	struct knet_host *host;
+	struct knet_link *link;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (!ss1) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type != CHECK_TYPE_ADDRESS) &&
+	    (type != CHECK_TYPE_MASK) &&
+	    (type != CHECK_TYPE_RANGE)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((acceptreject != CHECK_ACCEPT) &&
+	    (acceptreject != CHECK_REJECT)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type != CHECK_TYPE_ADDRESS) && (!ss2)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((type == CHECK_TYPE_RANGE) &&
+	    (ss1->ss_family != ss2->ss_family)) {
+			errno = EINVAL;
+			return -1;
+	}
+
+	if (link_id >= KNET_MAX_LINK) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = get_global_wrlock(knet_h);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_LINK, "Unable to get write lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	host = knet_h->host_index[host_id];
+	if (!host) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "Unable to find host %u: %s",
+			host_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	link = &host->link[link_id];
+
+	if (!link->configured) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is not configured: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	if (link->dynamic != KNET_LINK_DYNIP) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is a point to point connection: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	err = check_rm(knet_h, transport_link_get_acl_fd(knet_h, link), link->transport,
+		       ss1, ss2, type, acceptreject);
+	savederrno = errno;
+
+exit_unlock:
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+
+	errno = savederrno;
+	return err;
+}
+
+int knet_link_clear_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id)
+{
+	int savederrno = 0, err = 0;
+	struct knet_host *host;
+	struct knet_link *link;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (link_id >= KNET_MAX_LINK) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = get_global_wrlock(knet_h);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_LINK, "Unable to get write lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	host = knet_h->host_index[host_id];
+	if (!host) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "Unable to find host %u: %s",
+			host_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	link = &host->link[link_id];
+
+	if (!link->configured) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is not configured: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	if (link->dynamic != KNET_LINK_DYNIP) {
+		err = -1;
+		savederrno = EINVAL;
+		log_err(knet_h, KNET_SUB_LINK, "host %u link %u is a point to point connection: %s",
+			host_id, link_id, strerror(savederrno));
+		goto exit_unlock;
+	}
+
+	check_rmall(knet_h, transport_link_get_acl_fd(knet_h, link), link->transport);
+
+exit_unlock:
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+
 	errno = savederrno;
 	return err;
 }

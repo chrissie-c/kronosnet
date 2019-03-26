@@ -27,14 +27,14 @@
 #include "transport_sctp.h"
 #include "threads_common.h"
 
-#define empty_module 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
+#define empty_module 0, -1, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
 
-knet_transport_ops_t transport_modules_cmd[] = {
-	{ "LOOPBACK", KNET_TRANSPORT_LOOPBACK, 1, KNET_PMTUD_LOOPBACK_OVERHEAD, loopback_transport_init, loopback_transport_free, loopback_transport_link_set_config, loopback_transport_link_clear_config, loopback_transport_link_dyn_connect, loopback_transport_rx_sock_error, loopback_transport_tx_sock_error, loopback_transport_rx_is_data },
-	{ "UDP", KNET_TRANSPORT_UDP, 1, KNET_PMTUD_UDP_OVERHEAD, udp_transport_init, udp_transport_free, udp_transport_link_set_config, udp_transport_link_clear_config, udp_transport_link_dyn_connect, udp_transport_rx_sock_error, udp_transport_tx_sock_error, udp_transport_rx_is_data },
+static knet_transport_ops_t transport_modules_cmd[KNET_MAX_TRANSPORTS] = {
+	{ "LOOPBACK", KNET_TRANSPORT_LOOPBACK, 1, TRANSPORT_PROTO_LOOPBACK, USE_NO_ACL, TRANSPORT_PROTO_NOT_CONNECTION_ORIENTED, KNET_PMTUD_LOOPBACK_OVERHEAD, loopback_transport_init, loopback_transport_free, loopback_transport_link_set_config, loopback_transport_link_clear_config, loopback_transport_link_dyn_connect, loopback_transport_link_get_acl_fd, loopback_transport_rx_sock_error, loopback_transport_tx_sock_error, loopback_transport_rx_is_data },
+	{ "UDP", KNET_TRANSPORT_UDP, 1, TRANSPORT_PROTO_IP_PROTO, USE_GENERIC_ACL, TRANSPORT_PROTO_NOT_CONNECTION_ORIENTED, KNET_PMTUD_UDP_OVERHEAD, udp_transport_init, udp_transport_free, udp_transport_link_set_config, udp_transport_link_clear_config, udp_transport_link_dyn_connect, udp_transport_link_get_acl_fd, udp_transport_rx_sock_error, udp_transport_tx_sock_error, udp_transport_rx_is_data },
 	{ "SCTP", KNET_TRANSPORT_SCTP,
 #ifdef HAVE_NETINET_SCTP_H
-				       1, KNET_PMTUD_SCTP_OVERHEAD, sctp_transport_init, sctp_transport_free, sctp_transport_link_set_config, sctp_transport_link_clear_config, sctp_transport_link_dyn_connect, sctp_transport_rx_sock_error, sctp_transport_tx_sock_error, sctp_transport_rx_is_data },
+				       1, TRANSPORT_PROTO_IP_PROTO, USE_PROTO_ACL, TRANSPORT_PROTO_IS_CONNECTION_ORIENTED, KNET_PMTUD_SCTP_OVERHEAD, sctp_transport_init, sctp_transport_free, sctp_transport_link_set_config, sctp_transport_link_clear_config, sctp_transport_link_dyn_connect, sctp_transport_link_get_acl_fd, sctp_transport_rx_sock_error, sctp_transport_tx_sock_error, sctp_transport_rx_is_data },
 #else
 empty_module
 #endif
@@ -88,19 +88,24 @@ int transport_link_set_config(knet_handle_t knet_h, struct knet_link *kn_link, u
 		return -1;
 	}
 	kn_link->transport_connected = 0;
-	kn_link->transport_type = transport;
+	kn_link->transport = transport;
 	kn_link->proto_overhead = transport_modules_cmd[transport].transport_mtu_overhead;
 	return transport_modules_cmd[transport].transport_link_set_config(knet_h, kn_link);
 }
 
 int transport_link_clear_config(knet_handle_t knet_h, struct knet_link *kn_link)
 {
-	return transport_modules_cmd[kn_link->transport_type].transport_link_clear_config(knet_h, kn_link);
+	return transport_modules_cmd[kn_link->transport].transport_link_clear_config(knet_h, kn_link);
 }
 
 int transport_link_dyn_connect(knet_handle_t knet_h, int sockfd, struct knet_link *kn_link)
 {
-	return transport_modules_cmd[kn_link->transport_type].transport_link_dyn_connect(knet_h, sockfd, kn_link);
+	return transport_modules_cmd[kn_link->transport].transport_link_dyn_connect(knet_h, sockfd, kn_link);
+}
+
+int transport_link_get_acl_fd(knet_handle_t knet_h, struct knet_link *kn_link)
+{
+	return transport_modules_cmd[kn_link->transport].transport_link_get_acl_fd(knet_h, kn_link);
 }
 
 int transport_rx_sock_error(knet_handle_t knet_h, uint8_t transport, int sockfd, int recv_err, int recv_errno)
@@ -116,6 +121,21 @@ int transport_tx_sock_error(knet_handle_t knet_h, uint8_t transport, int sockfd,
 int transport_rx_is_data(knet_handle_t knet_h, uint8_t transport, int sockfd, struct knet_mmsghdr *msg)
 {
 	return transport_modules_cmd[transport].transport_rx_is_data(knet_h, sockfd, msg);
+}
+
+int transport_get_proto(knet_handle_t knet_h, uint8_t transport)
+{
+	return transport_modules_cmd[transport].transport_protocol;
+}
+
+int transport_get_acl_type(knet_handle_t knet_h, uint8_t transport)
+{
+	return transport_modules_cmd[transport].transport_acl_type;
+}
+
+int transport_get_connection_oriented(knet_handle_t knet_h, uint8_t transport)
+{
+	return transport_modules_cmd[transport].transport_is_connection_oriented;
 }
 
 /*
@@ -147,6 +167,8 @@ int knet_get_transport_list(struct knet_transport_info *transport_list,
 
 	*transport_list_entries = outidx;
 
+	if (!err)
+		errno = 0;
 	return err;
 }
 
@@ -167,7 +189,7 @@ const char *knet_get_transport_name_by_id(uint8_t transport)
 		savederrno = ENOENT;
 	}
 
-	errno = savederrno;
+	errno = name ? 0 : savederrno;
 	return name;
 }
 
@@ -199,7 +221,7 @@ uint8_t knet_get_transport_id_by_name(const char *name)
 		savederrno = EINVAL;
 	}
 
-	errno = savederrno;
+	errno = err == KNET_MAX_TRANSPORTS ? savederrno : 0;
 	return err;
 }
 
@@ -236,6 +258,7 @@ int knet_handle_set_transport_reconnect_interval(knet_handle_t knet_h, uint32_t 
 	knet_h->reconnect_int = msecs;
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
+	errno = 0;
 	return 0;
 }
 
@@ -264,5 +287,6 @@ int knet_handle_get_transport_reconnect_interval(knet_handle_t knet_h, uint32_t 
 	*msecs = knet_h->reconnect_int;
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
+	errno = 0;
 	return 0;
 }

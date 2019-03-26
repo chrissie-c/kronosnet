@@ -14,6 +14,7 @@
 #include <time.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <limits.h>
 
 /**
  * @file libknet.h
@@ -22,6 +23,8 @@
  *
  * Kronosnet is an advanced VPN system for High Availability applications.
  */
+
+#define KNET_API_VER 2
 
 /*
  * libknet limits
@@ -85,6 +88,12 @@ typedef uint16_t knet_node_id_t;
 
 #define KNET_HANDLE_FLAG_PRIVILEGED (1ULL << 0)
 
+/*
+ * threads timer resolution (see knet_handle_set_threads_timer_res below)
+ */
+
+#define KNET_THREADS_TIMER_RES 200000
+
 typedef struct knet_handle *knet_handle_t;
 
 /*
@@ -92,13 +101,13 @@ typedef struct knet_handle *knet_handle_t;
  */
 
 /**
- * knet_handle_new_ex
+ * knet_handle_new
  *
  * @brief create a new instance of a knet handle
  *
  * host_id  - Each host in a knet is identified with a unique
  *            ID. when creating a new handle local host_id
- *            must be specified (0 to UINT16T_MAX are all valid).
+ *            must be specified (0 to UINT16_MAX are all valid).
  *            It is the user's responsibility to check that the value
  *            is unique, or bad things might happen.
  *
@@ -109,13 +118,16 @@ typedef struct knet_handle *knet_handle_t;
  *            Make sure to either read from this filedescriptor properly and/or
  *            mark it O_NONBLOCK, otherwise if the fd becomes full, libknet could
  *            block.
+ *            It is strongly encouraged to use pipes (ex: pipe(2) or pipe2(2)) for
+ *            logging fds due to the atomic nature of writes between fds.
+ *            See also libknet test suite for reference and guidance.
  *
  * default_log_level -
  *            If logfd is specified, it will initialize all subsystems to log
  *            at default_log_level value. (see logging API)
  *
  * flags    - bitwise OR of some of the following flags:
- *   KNET_HANDLE_FLAG_PRIVILEGED: use privileged operations setting up the
+ *            KNET_HANDLE_FLAG_PRIVILEGED: use privileged operations setting up the
  *            communication sockets.  If disabled, failure to acquire large
  *            enough socket buffers is ignored but logged.  Inadequate buffers
  *            lead to poor performance.
@@ -128,20 +140,10 @@ typedef struct knet_handle *knet_handle_t;
  *   ERANGE       - buffer size readback returned unexpected type
  */
 
-knet_handle_t knet_handle_new_ex(knet_node_id_t host_id,
-				 int            log_fd,
-				 uint8_t        default_log_level,
-				 uint64_t	flags);
-
-/**
- * knet_handle_new
- *
- * @brief knet_handle_new_ex with flags = KNET_HANDLE_FLAG_PRIVILEGED.
- */
-
 knet_handle_t knet_handle_new(knet_node_id_t host_id,
-			      int      log_fd,
-			      uint8_t  default_log_level);
+			      int log_fd,
+			      uint8_t default_log_level,
+			      uint64_t flags);
 
 /**
  * knet_handle_free
@@ -156,6 +158,57 @@ knet_handle_t knet_handle_new(knet_node_id_t host_id,
  */
 
 int knet_handle_free(knet_handle_t knet_h);
+
+/**
+ * knet_handle_set_threads_timer_res
+ * @brief Change internal thread timer resolution
+ *
+ * knet_h   - pointer to knet_handle_t
+ *
+ * timeres  - some threads inside knet will use usleep(timeres)
+ *            to check if any activity has to be performed, or wait
+ *            for the next cycle. 'timeres' (expressed in nano seconds)
+ *            defines this interval, with a default of KNET_THREADS_TIMER_RES
+ *            (200000).
+ *            The lower this value is, the more often knet will perform
+ *            those checks and allows a more (time) precise execution of
+ *            some operations (for example ping/pong), at the cost of higher
+ *            CPU usage.
+ *            Accepted values:
+ *            0 - reset timer res to default
+ *            1 - 999 invalid (as it would cause 100% CPU spinning on some
+ *                    epoll operations)
+ *            1000 or higher - valid
+ *
+ * Unless you know exactly what you are doing, stay away from
+ * changing the default or seek written and notarized approval
+ * from the knet developer team.
+ *
+ * @return
+ * knet_handle_set_threads_timer_res returns
+ * 0 on success
+ * -1 on error and errno is set.
+ */
+
+int knet_handle_set_threads_timer_res(knet_handle_t knet_h,
+				      useconds_t timeres);
+
+/**
+ * knet_handle_get_threads_timer_res
+ * @brief Get internal thread timer resolutions
+ *
+ * knet_h   - pointer to knet_handle_t
+ *
+ * timeres  - current timer res value
+ *
+ * @return
+ * knet_handle_set_threads_timer_res returns
+ * 0 on success and timerres will contain the current value
+ * -1 on error and errno is set.
+ */
+
+int knet_handle_get_threads_timer_res(knet_handle_t knet_h,
+				      useconds_t *timeres);
 
 /**
  * knet_handle_enable_sock_notify
@@ -232,9 +285,9 @@ int knet_handle_enable_sock_notify(knet_handle_t knet_h,
  *            socketpair only if they have been created by knet_handle_add_datafd.
  *
  *            It is possible to pass either sockets or normal fds.
- *            User provided datafd will be marked as non-blocking and close-on-exit.
+ *            User provided datafd will be marked as non-blocking and close-on-exec.
  *
- * *channel - This value has the same effect of VLAN tagging.
+ * *channel - This value is analogous to the tag in VLAN tagging.
  *            A negative value will auto-allocate a channel.
  *            Setting a value between 0 and 31 will try to allocate that
  *            specific channel (unless already in use).
@@ -488,6 +541,45 @@ int knet_handle_enable_filter(knet_handle_t knet_h,
  */
 
 int knet_handle_setfwd(knet_handle_t knet_h, unsigned int enabled);
+
+/**
+ * knet_handle_enable_access_lists
+ *
+ * @brief Enable or disable usage of access lists (default: off)
+ *
+ * knet_h   - pointer to knet_handle_t
+ *
+ * enable   - set to 1 to use access lists, 0 to disable access_lists.
+ *
+ * @return
+ * knet_handle_enable_access_lists returns
+ * 0 on success
+ * -1 on error and errno is set.
+ *
+ * access lists are bound to links. There are 2 types of links:
+ * 1) point to point, where both source and destinations are well known
+ *    at configuration time.
+ * 2) open links, where only the source is known at configuration time.
+ *
+ * knet will automatically generate access lists for point to point links.
+ *
+ * For open links, knet provides 4 API calls to manipulate access lists:
+ * knet_link_add_acl(3), knet_link_rm_acl(3), knet_link_insert_acl(3)
+ * and knet_link_clear_acl(3).
+ * Those API calls will work exclusively on open links as they
+ * are of no use on point to point links.
+ *
+ * knet will not enforce any access list unless specifically enabled by
+ * knet_handle_enable_access_lists(3).
+ *
+ * From a security / programming perspective we recommend:
+ * - create the knet handle
+ * - enable access lists
+ * - configure hosts and links
+ * - configure access lists for open links
+ */
+
+int knet_handle_enable_access_lists(knet_handle_t knet_h, unsigned int enabled);
 
 #define KNET_PMTUD_DEFAULT_INTERVAL 60
 
@@ -743,6 +835,8 @@ struct knet_handle_stats {
 	uint64_t tx_compress_time_ave;
 	uint64_t tx_compress_time_min;
 	uint64_t tx_compress_time_max;
+	uint64_t tx_failed_to_compress;
+	uint64_t tx_unable_to_compress;
 
 	uint64_t rx_compressed_packets;
 	uint64_t rx_compressed_original_bytes;
@@ -750,6 +844,7 @@ struct knet_handle_stats {
 	uint64_t rx_compress_time_ave;
 	uint64_t rx_compress_time_min;
 	uint64_t rx_compress_time_max;
+	uint64_t rx_failed_to_decompress;
 
 	/* Overhead times, measured in usecs */
 	uint64_t tx_crypt_packets;
@@ -1427,6 +1522,165 @@ int knet_link_get_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t l
 
 int knet_link_clear_config(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id);
 
+/*
+ * Access lists management for open links
+ * see also knet_handle_enable_access_lists(3)
+ */
+
+/**
+ * check_type_t
+ * @brief address type enum for knet access lists
+ *
+ * CHECK_TYPE_ADDRESS is the equivalent of a single entry / IP address.
+ *                    for example: 10.1.9.3
+ *                    and the entry is stored in ss1. ss2 can be NULL.
+ *
+ * CHECK_TYPE_MASK    is used to configure network/netmask.
+ *                    for example: 192.168.0.0/24
+ *                    the network is stored in ss1 and the netmask in ss2.
+ *
+ * CHECK_TYPE_RANGE   defines a value / range of ip addresses.
+ *                    for example: 172.16.0.1-172.16.0.10
+ *                    the start is stored in ss1 and the end in ss2.
+ *
+ * Please be aware that the above examples refer only to IP based protocols.
+ * Other protocols might use ss1 and ss2 in slightly different ways.
+ * At the moment knet only supports IP based protocol, though that might change
+ * in the future.
+ */
+
+typedef enum {
+	CHECK_TYPE_ADDRESS,
+	CHECK_TYPE_MASK,
+	CHECK_TYPE_RANGE
+} check_type_t;
+
+/**
+ * check_acceptreject_t
+ * @brief enum for accept/reject in knet access lists
+ *
+ * accept or reject incoming packets defined in the access list entry
+ */
+
+typedef enum {
+	CHECK_ACCEPT,
+	CHECK_REJECT
+} check_acceptreject_t;
+
+/**
+ * knet_link_add_acl
+ *
+ * @brief Add access list entry to an open link
+ *
+ * knet_h    - pointer to knet_handle_t
+ *
+ * host_id   - see knet_host_add(3)
+ *
+ * link_id   - see knet_link_set_config(3)
+ *
+ * ss1 / ss2 / type / acceptreject - see typedef definitions for details
+ *
+ * IMPORTANT: the order in which access lists are added is critical and it
+ *            is left to the user to add them in the right order. knet
+ *            will not attempt to logically sort them.
+ *
+ *            For example:
+ *            1 - accept from 10.0.0.0/8
+ *            2 - reject from 10.0.0.1/32
+ *
+ *            is not the same as:
+ *
+ *            1 - reject from 10.0.0.1/32
+ *            2 - accept from 10.0.0.0/8
+ *
+ *            In the first example, rule number 2 will never match because
+ *            packets from 10.0.0.1 will be accepted by rule number 1.
+ *
+ * @return
+ * knet_link_add_acl
+ * 0 on success.
+ * -1 on error and errno is set.
+ */
+
+int knet_link_add_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
+		      struct sockaddr_storage *ss1,
+		      struct sockaddr_storage *ss2,
+		      check_type_t type, check_acceptreject_t acceptreject);
+
+/**
+ * knet_link_insert_acl
+ *
+ * @brief Insert access list entry to an open link at given index
+ *
+ * knet_h    - pointer to knet_handle_t
+ *
+ * host_id   - see knet_host_add(3)
+ *
+ * link_id   - see knet_link_set_config(3)
+ *
+ * index     - insert at position "index" where 0 is the first entry and -1
+ *             appends to the current list.
+ *
+ * ss1 / ss2 / type / acceptreject - see typedef definitions for details
+ *
+ * @return
+ * knet_link_insert_acl
+ * 0 on success.
+ * -1 on error and errno is set.
+ */
+
+int knet_link_insert_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
+			 int index,
+			 struct sockaddr_storage *ss1,
+			 struct sockaddr_storage *ss2,
+			 check_type_t type, check_acceptreject_t acceptreject);
+
+/**
+ * knet_link_rm_acl
+ *
+ * @brief Remove access list entry from an open link
+ *
+ * knet_h    - pointer to knet_handle_t
+ *
+ * host_id   - see knet_host_add(3)
+ *
+ * link_id   - see knet_link_set_config(3)
+ *
+ * ss1 / ss2 / type / acceptreject - see typedef definitions for details
+ *
+ * IMPORTANT: the data passed to this API call must match exactly that passed
+ *            to knet_link_add_acl(3).
+ *
+ * @return
+ * knet_link_rm_acl
+ * 0 on success.
+ * -1 on error and errno is set.
+ */
+
+int knet_link_rm_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
+		     struct sockaddr_storage *ss1,
+		     struct sockaddr_storage *ss2,
+		     check_type_t type, check_acceptreject_t acceptreject);
+
+/**
+ * knet_link_clear_acl
+ *
+ * @brief Remove all access list entries from an open link
+ *
+ * knet_h    - pointer to knet_handle_t
+ *
+ * host_id   - see knet_host_add(3)
+ *
+ * link_id   - see knet_link_set_config(3)
+ *
+ * @return
+ * knet_link_clear_acl
+ * 0 on success.
+ * -1 on error and errno is set.
+ */
+
+int knet_link_clear_acl(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id);
+
 /**
  * knet_link_set_enable
  *
@@ -1797,6 +2051,51 @@ struct knet_link_status {
 int knet_link_get_status(knet_handle_t knet_h, knet_node_id_t host_id, uint8_t link_id,
 			 struct knet_link_status *status, size_t struct_size);
 
+/**
+ * knet_link_enable_status_change_notify
+ *
+ * @brief Install a callback to get a link status change events
+ *
+ * knet_h   - pointer to knet_handle_t
+ *
+ * host_status_change_notify_fn_private_data -
+ *            void pointer to data that can be used to identify
+ *            the callback
+ *
+ * host_status_change_notify_fn -
+ *            is a callback function that is invoked every time
+ *            there is a change in a link status.
+ *            host status is identified by:
+ *            - connected, 0 if the link has been disconnected, 1 if the link
+ *                         is connected.
+ *            - remote, 0 if the host_id is connected locally or 1 if
+ *                      the there is one or more knet host(s) in between.
+ *                      NOTE: re-switching is NOT currently implemented,
+ *                            but this is ready for future and can avoid
+ *                            an API/ABI breakage later on.
+ *            - external, 0 if the host_id is configured locally or 1 if
+ *                        it has been added from remote nodes config.
+ *                        NOTE: dynamic topology is NOT currently implemented,
+ *                        but this is ready for future and can avoid
+ *                        an API/ABI breakage later on.
+ *            This function MUST NEVER block or add substantial delays.
+ *
+ * @return
+ * knet_host_status_change_notify returns
+ * 0 on success
+ * -1 on error and errno is set.
+ */
+
+int knet_link_enable_status_change_notify(knet_handle_t knet_h,
+					  void *link_status_change_notify_fn_private_data,
+					  void (*link_status_change_notify_fn) (
+						void *private_data,
+						knet_node_id_t host_id,
+						uint8_t link_id,
+						uint8_t connected,
+						uint8_t remote,
+						uint8_t external));
+
 /*
  * logging structs/API calls
  */
@@ -1909,18 +2208,22 @@ const char *knet_log_get_loglevel_name(uint8_t level);
 uint8_t knet_log_get_loglevel_id(const char *name);
 
 /*
- * every log message is composed by a text message (including a trailing \n)
+ * every log message is composed by a text message
  * and message level/subsystem IDs.
  * In order to make debugging easier it is possible to send those packets
  * straight to stdout/stderr (see knet_bench.c stdout option).
  */
 
-#define KNET_MAX_LOG_MSG_SIZE    256
+#define KNET_MAX_LOG_MSG_SIZE    254
+#if KNET_MAX_LOG_MSG_SIZE > PIPE_BUF
+#error KNET_MAX_LOG_MSG_SIZE cannot be bigger than PIPE_BUF for guaranteed system atomic writes
+#endif
 
 struct knet_log_msg {
-	char	msg[KNET_MAX_LOG_MSG_SIZE - (sizeof(uint8_t)*2)];
+	char	msg[KNET_MAX_LOG_MSG_SIZE];
 	uint8_t	subsystem;	/* KNET_SUB_* */
 	uint8_t msglevel;	/* KNET_LOG_* */
+	knet_handle_t knet_h;	/* pointer to the handle generating the log */
 };
 
 /**

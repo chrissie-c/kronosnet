@@ -107,7 +107,7 @@ exit_unlock:
 	if (err < 0) {
 		free(host);
 	}
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -179,7 +179,7 @@ int knet_host_remove(knet_handle_t knet_h, knet_node_id_t host_id)
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -239,7 +239,7 @@ int knet_host_set_name(knet_handle_t knet_h, knet_node_id_t host_id, const char 
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -277,7 +277,7 @@ int knet_host_get_name_by_host_id(knet_handle_t knet_h, knet_node_id_t host_id,
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -324,7 +324,7 @@ int knet_host_get_id_by_host_name(knet_handle_t knet_h, const char *name,
 	}
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -355,7 +355,7 @@ int knet_host_get_host_list(knet_handle_t knet_h,
 	*host_ids_entries = knet_h->host_ids_entries;
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -406,7 +406,7 @@ int knet_host_set_policy(knet_handle_t knet_h, knet_node_id_t host_id,
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -445,7 +445,7 @@ int knet_host_get_policy(knet_handle_t knet_h, knet_node_id_t host_id,
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -486,7 +486,7 @@ int knet_host_get_status(knet_handle_t knet_h, knet_node_id_t host_id,
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -524,6 +524,7 @@ int knet_host_enable_status_change_notify(knet_handle_t knet_h,
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = 0;
 	return 0;
 }
 
@@ -679,12 +680,12 @@ int _host_dstcache_update_sync(knet_handle_t knet_h, struct knet_host *host)
 	}
 
 	if (host->link_handler_policy == KNET_LINK_POLICY_PASSIVE) {
-		log_debug(knet_h, KNET_SUB_HOST, "host: %u (passive) best link: %u (pri: %u)",
-			  host->host_id, host->link[host->active_links[0]].link_id,
-			  host->link[host->active_links[0]].priority);
+		log_info(knet_h, KNET_SUB_HOST, "host: %u (passive) best link: %u (pri: %u)",
+			 host->host_id, host->link[host->active_links[0]].link_id,
+			 host->link[host->active_links[0]].priority);
 	} else {
-		log_debug(knet_h, KNET_SUB_HOST, "host: %u has %u active links",
-			  host->host_id, host->active_link_entries);
+		log_info(knet_h, KNET_SUB_HOST, "host: %u has %u active links",
+			 host->host_id, host->active_link_entries);
 	}
 
 	/* no active links, we can clean the circular buffers and indexes */

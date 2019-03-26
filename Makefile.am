@@ -27,7 +27,7 @@ EXTRA_DIST		= autogen.sh .version \
 			  NOTES_TO_PACKAGE_MAINTAINERS \
 			  $(SPEC).in build-aux
 
-SUBDIRS			= init libtap libknet kronosnetd
+SUBDIRS			= init libnozzle libknet kronosnetd
 
 if BUILD_MAN
 SUBDIRS			+= man
@@ -56,14 +56,14 @@ distclean-local:
 
 $(SPEC): $(SPEC).in .version config.status
 	rm -f $@-t $@
-	date="`LC_ALL=C date "+%a %b %d %Y"`" && \
+	date="`LC_ALL=C $(UTC_DATE_AT)$(SOURCE_EPOCH) "+%a %b %d %Y"`" && \
 	if [ -f $(abs_srcdir)/.tarball-version ]; then \
 		gitver="`cat $(abs_srcdir)/.tarball-version`" && \
 		rpmver=$$gitver && \
 		alphatag="" && \
 		dirty="" && \
 		numcomm="0"; \
-	else \
+	elif [ "`git log -1 --pretty=format:x . 2>&1`" = "x" ]; then \
 		gitver="`GIT_DIR=$(abs_srcdir)/.git git describe --abbrev=4 --match='v*' HEAD 2>/dev/null`" && \
 		rpmver=`echo $$gitver | sed -e "s/^v//" -e "s/-.*//g"` && \
 		alphatag=`echo $$gitver | sed -e "s/.*-//" -e "s/^g//"` && \
@@ -72,6 +72,12 @@ $(SPEC): $(SPEC).in .version config.status
 		cd $(abs_srcdir) && \
 		git update-index --refresh > /dev/null 2>&1 || true && \
 		dirty=`git diff-index --name-only HEAD 2>/dev/null` && cd - 2>/dev/null; \
+	else \
+		gitver="`cd $(abs_srcdir); build-aux/git-version-gen .tarball-version .gitarchivever`" && \
+		rpmver=$$gitver && \
+		alphatag="" && \
+		dirty="" && \
+		numcomm="0"; \
 	fi && \
 	if [ -n "$$dirty" ]; then dirty="dirty"; else dirty=""; fi && \
 	if [ "$$numcomm" = "0" ]; then \
@@ -137,10 +143,10 @@ if BUILD_KRONOSNETD
 else
 	sed -i -e "s#@kronosnetd@#bcond_with#g" $@-t
 endif
-if BUILD_LIBTAP
-	sed -i -e "s#@libtap@#bcond_without#g" $@-t
+if BUILD_LIBNOZZLE
+	sed -i -e "s#@libnozzle@#bcond_without#g" $@-t
 else
-	sed -i -e "s#@libtap@#bcond_with#g" $@-t
+	sed -i -e "s#@libnozzle@#bcond_with#g" $@-t
 endif
 if BUILD_RUNAUTOGEN
 	sed -i -e "s#@runautogen@#bcond_without#g" $@-t
@@ -161,6 +167,11 @@ if BUILD_MAN
 	sed -i -e "s#@buildman@#bcond_without#g" $@-t
 else
 	sed -i -e "s#@buildman@#bcond_with#g" $@-t
+endif
+if INSTALL_TESTS
+	sed -i -e "s#@installtests@#bcond_without#g" $@-t
+else
+	sed -i -e "s#@installtests@#bcond_with#g" $@-t
 endif
 	sed -i -e "s#@defaultadmgroup@#$(DEFAULTADMGROUP)#g" $@-t
 	chmod a-w $@-t
@@ -191,6 +202,7 @@ BUILT_SOURCES	= .version
 
 dist-hook: gen-ChangeLog
 	echo $(VERSION) > $(distdir)/.tarball-version
+	echo $(SOURCE_EPOCH) > $(distdir)/source_epoch
 
 gen_start_date = 2000-01-01
 .PHONY: gen-ChangeLog

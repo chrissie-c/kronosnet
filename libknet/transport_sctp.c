@@ -19,6 +19,8 @@
 #include "compat.h"
 #include "host.h"
 #include "links.h"
+#include "links_acl.h"
+#include "links_acl_ip.h"
 #include "logging.h"
 #include "common.h"
 #include "transport_common.h"
@@ -37,6 +39,8 @@ typedef struct sctp_handle_info {
 	int listensockfd[2];
 	pthread_t connect_thread;
 	pthread_t listen_thread;
+	socklen_t event_subscribe_kernel_size;
+	char *event_subscribe_buffer;
 } sctp_handle_info_t;
 
 /*
@@ -130,16 +134,11 @@ exit_error:
 static int _enable_sctp_notifications(knet_handle_t knet_h, int sock, const char *type)
 {
 	int err = 0, savederrno = 0;
-	struct sctp_event_subscribe events;
+	sctp_handle_info_t *handle_info = knet_h->transports[KNET_TRANSPORT_SCTP];
 
-	memset(&events, 0, sizeof (events));
-	events.sctp_data_io_event = 1;
-	events.sctp_association_event = 1;
-	events.sctp_send_failure_event = 1;
-	events.sctp_address_event = 1;
-	events.sctp_peer_error_event = 1;
-	events.sctp_shutdown_event = 1;
-	if (setsockopt(sock, IPPROTO_SCTP, SCTP_EVENTS, &events, sizeof (events)) < 0) {
+	if (setsockopt(sock, IPPROTO_SCTP, SCTP_EVENTS,
+		       handle_info->event_subscribe_buffer,
+		       handle_info->event_subscribe_kernel_size) < 0) {
 		savederrno = errno;
 		err = -1;
 		log_err(knet_h, KNET_SUB_TRANSP_SCTP, "Unable to enable %s events: %s",
@@ -303,7 +302,7 @@ int sctp_transport_tx_sock_error(knet_handle_t knet_h, int sockfd, int recv_err,
 #endif
 			/* Don't hold onto the lock while sleeping */
 			pthread_rwlock_unlock(&knet_h->global_rwlock);
-			usleep(KNET_THREADS_TIMERES / 16);
+			usleep(knet_h->threads_timer_res / 16);
 			pthread_rwlock_rdlock(&knet_h->global_rwlock);
 			return 1;
 		}
@@ -409,7 +408,7 @@ int sctp_transport_rx_sock_error(knet_handle_t knet_h, int sockfd, int recv_err,
 
 	/* Don't hold onto the lock while sleeping */
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	usleep(KNET_THREADS_TIMERES / 2);
+	usleep(knet_h->threads_timer_res / 2);
 	pthread_rwlock_rdlock(&knet_h->global_rwlock);
 	return 0;
 }
@@ -629,8 +628,17 @@ static void *_sctp_connect_thread(void *data)
 	sctp_handle_info_t *handle_info = knet_h->transports[KNET_TRANSPORT_SCTP];
 	struct epoll_event events[KNET_EPOLL_MAX_EVENTS];
 
+	set_thread_status(knet_h, KNET_THREAD_SCTP_CONN, KNET_THREAD_STARTED);
+
 	while (!shutdown_in_progress(knet_h)) {
-		nev = epoll_wait(handle_info->connect_epollfd, events, KNET_EPOLL_MAX_EVENTS, -1);
+		nev = epoll_wait(handle_info->connect_epollfd, events, KNET_EPOLL_MAX_EVENTS, knet_h->threads_timer_res / 1000);
+
+		/*
+		 * we use timeout to detect if thread is shutting down
+		 */
+		if (nev == 0) {
+			continue;
+		}
 
 		if (nev < 0) {
 			log_debug(knet_h, KNET_SUB_TRANSP_SCTP, "SCTP connect handler EPOLL ERROR: %s",
@@ -676,6 +684,9 @@ static void *_sctp_connect_thread(void *data)
 		 */
 		usleep(knet_h->reconnect_int * 1000);
 	}
+
+	set_thread_status(knet_h, KNET_THREAD_SCTP_CONN, KNET_THREAD_STOPPED);
+
 	return NULL;
 }
 
@@ -719,6 +730,16 @@ static void _handle_incoming_sctp(knet_handle_t knet_h, int listen_sock)
 
 	log_debug(knet_h, KNET_SUB_TRANSP_SCTP, "Incoming: received connection from: %s port: %s",
 						addr_str, port_str);
+	if (knet_h->use_access_lists) {
+		if (!check_validate(knet_h, listen_sock, KNET_TRANSPORT_SCTP, &ss)) {
+			savederrno = EINVAL;
+			err = -1;
+			log_debug(knet_h, KNET_SUB_TRANSP_SCTP, "Connection rejected from %s/%s", addr_str, port_str);
+			close(new_fd);
+			errno = savederrno;
+			return;
+		}
+	}
 
 	/*
 	 * Keep a track of all accepted FDs
@@ -862,8 +883,17 @@ static void *_sctp_listen_thread(void *data)
 	sctp_handle_info_t *handle_info = knet_h->transports[KNET_TRANSPORT_SCTP];
 	struct epoll_event events[KNET_EPOLL_MAX_EVENTS];
 
+	set_thread_status(knet_h, KNET_THREAD_SCTP_LISTEN, KNET_THREAD_STARTED);
+
 	while (!shutdown_in_progress(knet_h)) {
-		nev = epoll_wait(handle_info->listen_epollfd, events, KNET_EPOLL_MAX_EVENTS, -1);
+		nev = epoll_wait(handle_info->listen_epollfd, events, KNET_EPOLL_MAX_EVENTS, knet_h->threads_timer_res / 1000);
+
+		/*
+		 * we use timeout to detect if thread is shutting down
+		 */
+		if (nev == 0) {
+			continue;
+		}
 
 		if (nev < 0) {
 			log_debug(knet_h, KNET_SUB_TRANSP_SCTP, "SCTP listen handler EPOLL ERROR: %s",
@@ -895,6 +925,9 @@ static void *_sctp_listen_thread(void *data)
 		}
 		pthread_rwlock_unlock(&knet_h->global_rwlock);
 	}
+
+	set_thread_status(knet_h, KNET_THREAD_SCTP_LISTEN, KNET_THREAD_STOPPED);
+
 	return NULL;
 }
 
@@ -915,6 +948,10 @@ static sctp_listen_link_info_t *sctp_link_listener_start(knet_handle_t knet_h, s
 	 */
 	knet_list_for_each_entry(info, &handle_info->listen_links_list, list) {
 		if (memcmp(&info->src_address, &kn_link->src_addr, sizeof(struct sockaddr_storage)) == 0) {
+			if ((check_add(knet_h, info->listen_sock, KNET_TRANSPORT_SCTP, -1,
+				       &kn_link->dst_addr, &kn_link->dst_addr, CHECK_TYPE_ADDRESS, CHECK_ACCEPT) < 0) && (errno != EEXIST)) {
+				return NULL;
+			}
 			return info;
 		}
 	}
@@ -969,6 +1006,15 @@ static sctp_listen_link_info_t *sctp_link_listener_start(knet_handle_t knet_h, s
 		goto exit_error;
 	}
 
+	if ((check_add(knet_h, listen_sock, KNET_TRANSPORT_SCTP, -1,
+		       &kn_link->dst_addr, &kn_link->dst_addr, CHECK_TYPE_ADDRESS, CHECK_ACCEPT) < 0) && (errno != EEXIST)) {
+		savederrno = errno;
+		err = -1;
+		log_err(knet_h, KNET_SUB_TRANSP_SCTP, "Unable to configure default access lists: %s",
+			strerror(savederrno));
+		goto exit_error;
+	}
+
 	memset(&ev, 0, sizeof(struct epoll_event));
 	ev.events = EPOLLIN;
 	ev.data.fd = listen_sock;
@@ -991,6 +1037,7 @@ exit_error:
 		if (info->on_listener_epoll) {
 			epoll_ctl(handle_info->listen_epollfd, EPOLL_CTL_DEL, listen_sock, &ev);
 		}
+		check_rmall(knet_h, listen_sock, KNET_TRANSPORT_SCTP);
 		if (listen_sock >= 0) {
 			close(listen_sock);
 		}
@@ -1022,12 +1069,16 @@ static int sctp_link_listener_stop(knet_handle_t knet_h, struct knet_link *kn_li
 
 			link_info = host->link[link_idx].transport_link;
 			if ((link_info) &&
-			    (link_info->listener == info) &&
-			    (host->link[link_idx].status.enabled == 1)) {
+			    (link_info->listener == info)) {
 				found = 1;
 				break;
 			}
 		}
+	}
+
+	if ((check_rm(knet_h, info->listen_sock, KNET_TRANSPORT_SCTP,
+		      &kn_link->dst_addr, &kn_link->dst_addr, CHECK_TYPE_ADDRESS, CHECK_ACCEPT) < 0) && (errno != ENOENT)) {
+		log_debug(knet_h, KNET_SUB_TRANSP_SCTP, "Unable to remove default access lists for %d", info->listen_sock);
 	}
 
 	if (found) {
@@ -1059,6 +1110,8 @@ static int sctp_link_listener_stop(knet_handle_t knet_h, struct knet_link *kn_li
 			strerror(savederrno));
 		goto exit_error;
 	}
+
+	check_rmall(knet_h, info->listen_sock, KNET_TRANSPORT_SCTP);
 
 	close(info->listen_sock);
 
@@ -1279,9 +1332,71 @@ int sctp_transport_free(knet_handle_t knet_h)
 		close(handle_info->connect_epollfd);
 	}
 
+	free(handle_info->event_subscribe_buffer);
 	free(handle_info);
 	knet_h->transports[KNET_TRANSPORT_SCTP] = NULL;
 
+	return 0;
+}
+
+static int _sctp_subscribe_init(knet_handle_t knet_h)
+{
+	int test_socket, savederrno;
+	sctp_handle_info_t *handle_info = knet_h->transports[KNET_TRANSPORT_SCTP];
+	char dummy_events[100];
+	struct sctp_event_subscribe *events;
+	/* Below we set the first 6 fields of this expanding struct.
+	 * SCTP_EVENTS is deprecated, but SCTP_EVENT is not available
+	 * on Linux; on the other hand, FreeBSD and old Linux does not
+	 * accept small transfers, so we can't simply use this minimum
+	 * everywhere.  Thus we query and store the native size. */
+	const unsigned int subscribe_min = 6;
+
+	test_socket = socket(PF_INET, SOCK_STREAM, IPPROTO_SCTP);
+	if (test_socket < 0) {
+		if (errno == EPROTONOSUPPORT) {
+			log_debug(knet_h, KNET_SUB_TRANSP_SCTP, "SCTP not supported, skipping initialization");
+			return 0;
+		}
+		savederrno = errno;
+		log_err(knet_h, KNET_SUB_TRANSP_SCTP, "Unable to create test socket: %s",
+			strerror(savederrno));
+		return savederrno;
+	}
+	handle_info->event_subscribe_kernel_size = sizeof dummy_events;
+	if (getsockopt(test_socket, IPPROTO_SCTP, SCTP_EVENTS, &dummy_events,
+		       &handle_info->event_subscribe_kernel_size)) {
+		close(test_socket);
+		savederrno = errno;
+		log_err(knet_h, KNET_SUB_TRANSP_SCTP, "Unable to query kernel size of struct sctp_event_subscribe: %s",
+			strerror(savederrno));
+		return savederrno;
+	}
+	close(test_socket);
+	if (handle_info->event_subscribe_kernel_size < subscribe_min) {
+		savederrno = ERANGE;
+		log_err(knet_h, KNET_SUB_TRANSP_SCTP,
+			"No kernel support for the necessary notifications: struct sctp_event_subscribe is %u bytes, %u needed",
+			handle_info->event_subscribe_kernel_size, subscribe_min);
+		return savederrno;
+	}
+	events = malloc(handle_info->event_subscribe_kernel_size);
+	if (!events) {
+		savederrno = errno;
+		log_err(knet_h, KNET_SUB_TRANSP_SCTP,
+			"Failed to allocate event subscribe buffer: %s", strerror(savederrno));
+		return savederrno;
+	}
+	memset(events, 0, handle_info->event_subscribe_kernel_size);
+	events->sctp_data_io_event = 1;
+	events->sctp_association_event = 1;
+	events->sctp_address_event = 1;
+	events->sctp_send_failure_event = 1;
+	events->sctp_peer_error_event = 1;
+	events->sctp_shutdown_event = 1;
+	handle_info->event_subscribe_buffer = (char *)events;
+	log_debug(knet_h, KNET_SUB_TRANSP_SCTP, "Size of struct sctp_event_subscribe is %u in kernel, %zu in user space",
+		  handle_info->event_subscribe_kernel_size, sizeof(struct sctp_event_subscribe));
 	return 0;
 }
 
@@ -1305,16 +1420,22 @@ int sctp_transport_init(knet_handle_t knet_h)
 
 	knet_h->transports[KNET_TRANSPORT_SCTP] = handle_info;
 
+	savederrno = _sctp_subscribe_init(knet_h);
+	if (savederrno) {
+		err = -1;
+		goto exit_fail;
+	}
+
 	knet_list_init(&handle_info->listen_links_list);
 	knet_list_init(&handle_info->connect_links_list);
 
 	handle_info->listen_epollfd = epoll_create(KNET_EPOLL_MAX_EVENTS + 1);
-        if (handle_info->listen_epollfd < 0) {
-                savederrno = errno;
+	if (handle_info->listen_epollfd < 0) {
+		savederrno = errno;
 		err = -1;
-                log_err(knet_h, KNET_SUB_TRANSP_SCTP, "Unable to create epoll listen fd: %s",
-                        strerror(savederrno));
-                goto exit_fail;
+		log_err(knet_h, KNET_SUB_TRANSP_SCTP, "Unable to create epoll listen fd: %s",
+			strerror(savederrno));
+		goto exit_fail;
         }
 
 	if (_fdset_cloexec(handle_info->listen_epollfd)) {
@@ -1383,6 +1504,7 @@ int sctp_transport_init(knet_handle_t knet_h)
 	/*
 	 * Start connect & listener threads
 	 */
+	set_thread_status(knet_h, KNET_THREAD_SCTP_LISTEN, KNET_THREAD_REGISTERED);
 	savederrno = pthread_create(&handle_info->listen_thread, 0, _sctp_listen_thread, (void *) knet_h);
 	if (savederrno) {
 		err = -1;
@@ -1391,6 +1513,7 @@ int sctp_transport_init(knet_handle_t knet_h)
 		goto exit_fail;
 	}
 
+	set_thread_status(knet_h, KNET_THREAD_SCTP_CONN, KNET_THREAD_REGISTERED);
 	savederrno = pthread_create(&handle_info->connect_thread, 0, _sctp_connect_thread, (void *) knet_h);
 	if (savederrno) {
 		err = -1;
@@ -1413,5 +1536,12 @@ int sctp_transport_link_dyn_connect(knet_handle_t knet_h, int sockfd, struct kne
 	kn_link->status.dynconnected = 1;
 	kn_link->transport_connected = 1;
 	return 0;
+}
+
+int sctp_transport_link_get_acl_fd(knet_handle_t knet_h, struct knet_link *kn_link)
+{
+	sctp_connect_link_info_t *this_link_info = kn_link->transport_link;
+	sctp_listen_link_info_t *info = this_link_info->listener;
+	return info->listen_sock;
 }
 #endif

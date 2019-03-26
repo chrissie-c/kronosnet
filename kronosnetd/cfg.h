@@ -13,13 +13,13 @@
 #include <stdint.h>
 #include <net/if.h>
 
-#include "libtap.h"
+#include "libnozzle.h"
 #include "libknet.h"
 
 #define KNET_RING_DEFPORT 50000
 
 struct knet_cfg_eth {
-	tap_t tap;
+	nozzle_t nozzle;
 	int auto_mtu;
 	knet_node_id_t node_id;
 };

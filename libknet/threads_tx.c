@@ -48,7 +48,7 @@ static int _dispatch_to_links(knet_handle_t knet_h, struct knet_host *dst_host, 
 
 		cur_link = &dst_host->link[dst_host->active_links[link_idx]];
 
-		if (cur_link->transport_type == KNET_TRANSPORT_LOOPBACK) {
+		if (cur_link->transport == KNET_TRANSPORT_LOOPBACK) {
 			continue;
 		}
 
@@ -68,10 +68,11 @@ retry:
 		cur = &msg[prev_sent];
 
 		sent_msgs = _sendmmsg(dst_host->link[dst_host->active_links[link_idx]].outsock,
+				      transport_get_connection_oriented(knet_h, dst_host->link[dst_host->active_links[link_idx]].transport),
 				      &cur[0], msgs_to_send - prev_sent, MSG_DONTWAIT | MSG_NOSIGNAL);
 		savederrno = errno;
 
-		err = transport_tx_sock_error(knet_h, dst_host->link[dst_host->active_links[link_idx]].transport_type, dst_host->link[dst_host->active_links[link_idx]].outsock, sent_msgs, savederrno);
+		err = transport_tx_sock_error(knet_h, dst_host->link[dst_host->active_links[link_idx]].transport, dst_host->link[dst_host->active_links[link_idx]].outsock, sent_msgs, savederrno);
 		switch(err) {
 			case -1: /* unrecoverable error */
 				cur_link->status.stats.tx_data_errors++;
@@ -235,7 +236,7 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, size_t inlen, int8_t chan
 						local_link->status.stats.tx_data_retries++;
 						buf += err;
 						buflen -= err;
-						usleep(KNET_THREADS_TIMERES / 16);
+						usleep(knet_h->threads_timer_res / 16);
 						goto local_retry;
 					}
 					if (err == buflen) {
@@ -348,6 +349,7 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, size_t inlen, int8_t chan
 			       (const unsigned char *)inbuf->khp_data_userdata, inlen,
 			       knet_h->send_to_links_buf_compress, (ssize_t *)&cmp_outlen);
 		if (err < 0) {
+			knet_h->stats.tx_failed_to_compress++;
 			log_warn(knet_h, KNET_SUB_COMPRESS, "Compression failed (%d): %s", err, strerror(errno));
 		} else {
 			/* Collect stats */
@@ -372,10 +374,12 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, size_t inlen, int8_t chan
 				memmove(inbuf->khp_data_userdata, knet_h->send_to_links_buf_compress, cmp_outlen);
 				inlen = cmp_outlen;
 				data_compressed = 1;
+			} else {
+				knet_h->stats.tx_unable_to_compress++;
 			}
 		}
 	}
-	if ((knet_h->compress_model > 0) && (inlen <= knet_h->compress_threshold)) {
+	if (knet_h->compress_model > 0 && !data_compressed) {
 		knet_h->stats.tx_uncompressed_packets++;
 	}
 
@@ -619,7 +623,7 @@ int knet_send_sync(knet_handle_t knet_h, const char *buff, const size_t buff_len
 out:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -639,21 +643,11 @@ static void _handle_send_to_links(knet_handle_t knet_h, struct msghdr *msg, int 
 	if (inlen == 0) {
 		savederrno = 0;
 		docallback = 1;
-		goto out;
-	}
-	if (inlen < 0) {
-		savederrno = errno;
-		docallback = 1;
-		goto out;
-	}
-
-	knet_h->recv_from_sock_buf->kh_type = type;
-	_parse_recv_from_sock(knet_h, inlen, channel, 0);
-
-out:
-	if (inlen < 0) {
+	} else if (inlen < 0) {
 		struct epoll_event ev;
 
+		savederrno = errno;
+		docallback = 1;
 		memset(&ev, 0, sizeof(struct epoll_event));
 
 		if (epoll_ctl(knet_h->send_to_links_epollfd,
@@ -663,7 +657,9 @@ out:
 		} else {
 			knet_h->sockfd[channel].has_error = 1;
 		}
-
+	} else {
+		knet_h->recv_from_sock_buf->kh_type = type;
+		_parse_recv_from_sock(knet_h, inlen, channel, 0);
 	}
 
 	if (docallback) {
@@ -686,6 +682,8 @@ void *_handle_send_to_links_thread(void *data)
 	struct msghdr msg;
 	struct sockaddr_storage address;
 
+	set_thread_status(knet_h, KNET_THREAD_TX, KNET_THREAD_STARTED);
+
 	memset(&iov_in, 0, sizeof(iov_in));
 	iov_in.iov_base = (void *)knet_h->recv_from_sock_buf->khp_data_userdata;
 	iov_in.iov_len = KNET_MAX_PACKET_SIZE;
@@ -707,7 +705,14 @@ void *_handle_send_to_links_thread(void *data)
 	}
 
 	while (!shutdown_in_progress(knet_h)) {
-		nev = epoll_wait(knet_h->send_to_links_epollfd, events, KNET_EPOLL_MAX_EVENTS + 1, -1);
+		nev = epoll_wait(knet_h->send_to_links_epollfd, events, KNET_EPOLL_MAX_EVENTS + 1, knet_h->threads_timer_res / 1000);
+
+		/*
+		 * we use timeout to detect if thread is shutting down
+		 */
+		if (nev == 0) {
+			continue;
+		}
 
 		if (pthread_rwlock_rdlock(&knet_h->global_rwlock) != 0) {
 			log_debug(knet_h, KNET_SUB_TX, "Unable to get read lock");
@@ -740,6 +745,8 @@ void *_handle_send_to_links_thread(void *data)
 		}
 		pthread_rwlock_unlock(&knet_h->global_rwlock);
 	}
+
+	set_thread_status(knet_h, KNET_THREAD_TX, KNET_THREAD_STOPPED);
 
 	return NULL;
 }

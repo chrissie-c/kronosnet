@@ -13,7 +13,7 @@
 
 AC_PREREQ([2.63])
 AC_INIT([kronosnet],
-	m4_esyscmd([build-aux/git-version-gen .tarball-version]),
+	m4_esyscmd([build-aux/git-version-gen .tarball-version .gitarchivever]),
 	[devel@lists.kronosnet.org])
 # Don't let AC_PROC_CC (invoked by AC_USE_SYSTEM_EXTENSIONS) replace
 # undefined CFLAGS with -g -O2, overriding our special OPT_CFLAGS.
@@ -144,6 +144,11 @@ KNET_OPTION_DEFINES([bzip2],[compress],[
 				[AC_MSG_ERROR(["missing required bzlib.h"])])])
 ])
 
+AC_ARG_ENABLE([install-tests],
+	[AS_HELP_STRING([--enable-install-tests],[install tests])],,
+	[ enable_install_tests="no" ])
+AM_CONDITIONAL([INSTALL_TESTS], [test x$enable_install_tests = xyes])
+
 AC_ARG_ENABLE([poc],
 	[AS_HELP_STRING([--enable-poc],[enable building poc code])],,
 	[ enable_poc="no" ])
@@ -166,31 +171,14 @@ AC_ARG_ENABLE([rpm-debuginfo],
 AM_CONDITIONAL([BUILD_RPM_DEBUGINFO], [test x$enable_rpm_debuginfo = xyes])
 AM_CONDITIONAL([OVERRIDE_RPM_DEBUGINFO], [test x$override_rpm_debuginfo_option = xyes])
 
-AC_ARG_ENABLE([libtap],
-	[AS_HELP_STRING([--enable-libtap],[libtap support])],,
-	[ enable_libtap="no" ])
+AC_ARG_ENABLE([libnozzle],
+	[AS_HELP_STRING([--enable-libnozzle],[libnozzle support])],,
+	[ enable_libnozzle="yes" ])
 
 if test "x$enable_kronosnetd" = xyes; then
-	enable_libtap=yes
+	enable_libnozzle=yes
 fi
-AM_CONDITIONAL([BUILD_LIBTAP], [test x$enable_libtap = xyes])
-
-## local helper functions
-# this function checks if CC support options passed as
-# args. Global CPPFLAGS are ignored during this test.
-cc_supports_flag() {
-	saveCPPFLAGS="$CPPFLAGS"
-	CPPFLAGS="$@"
-	if echo $CC | grep -q clang; then
-		CPPFLAGS="-Werror $CPPFLAGS"
-	fi
-	AC_MSG_CHECKING([whether $CC supports "$@"])
-	AC_PREPROC_IFELSE([AC_LANG_PROGRAM([])],
-			  [RC=0; AC_MSG_RESULT([yes])],
-			  [RC=1; AC_MSG_RESULT([no])])
-	CPPFLAGS="$saveCPPFLAGS"
-	return $RC
-}
+AM_CONDITIONAL([BUILD_LIBNOZZLE], [test x$enable_libnozzle = xyes])
 
 # Checks for libraries.
 AX_PTHREAD(,[AC_MSG_ERROR([POSIX threads support is required])])
@@ -217,9 +205,6 @@ case "$host_os" in
 	*bsd*)
 		AC_DEFINE_UNQUOTED([KNET_BSD], [1], [Compiling for BSD platform])
 		AC_MSG_RESULT([BSD])
-		if test "x$enable_libtap" = xyes; then
-			AC_MSG_ERROR([libtap is not currently supported on BSD platforms])
-		fi
 		;;
 	*)
 		AC_MSG_ERROR([Unsupported OS? hmmmm])
@@ -278,7 +263,17 @@ if test "x$enable_man" = "xyes"; then
 	ac_cv_path_PKG_CONFIG="$saved_ac_cv_path_PKG_CONFIG"
 fi
 
-# checks (for kronosnetd)
+# checks for libnozzle
+if test "x$enable_libnozzle" = xyes; then
+	if `echo $host_os | grep -q linux`; then
+		PKG_CHECK_MODULES([libnl], [libnl-3.0])
+		PKG_CHECK_MODULES([libnlroute], [libnl-route-3.0 >= 3.3], [],
+			[PKG_CHECK_MODULES([libnlroute], [libnl-route-3.0 < 3.3],
+					   [AC_DEFINE_UNQUOTED([LIBNL3_WORKAROUND], [1], [Enable libnl < 3.3 build workaround])], [])])
+	fi
+fi
+
+# checks for kronosnetd
 if test "x$enable_kronosnetd" = xyes; then
 	AC_CHECK_HEADERS([security/pam_appl.h],
 			 [AC_CHECK_LIB([pam], [pam_start],
@@ -303,6 +298,11 @@ fi
 # local options
 AC_ARG_ENABLE([debug],
 	[AS_HELP_STRING([--enable-debug],[enable debug build])])
+
+AC_ARG_WITH([testdir],
+	[AS_HELP_STRING([--with-testdir=DIR],[path to /usr/lib../kronosnet/tests/ dir where to install the test suite])],
+	[ TESTDIR="$withval" ],
+	[ TESTDIR="$libdir/kronosnet/tests" ])
 
 AC_ARG_WITH([initdefaultdir],
 	[AS_HELP_STRING([--with-initdefaultdir=DIR],[path to /etc/sysconfig or /etc/default dir])],
@@ -343,6 +343,7 @@ DEFAULT_CONFIG_DIR=${sysconfdir}/kronosnet
 
 ## do subst
 
+AC_SUBST([TESTDIR])
 AC_SUBST([DEFAULT_CONFIG_DIR])
 AC_SUBST([INITDEFAULTDIR])
 AC_SUBST([INITDDIR])
@@ -397,68 +398,61 @@ else
 	GDB_FLAGS="-g"
 fi
 
-# extra warnings
-EXTRA_WARNINGS=""
+DEFAULT_CFLAGS="-Werror -Wall -Wextra"
 
-WARNLIST="
-	all
-	extra
-	unused
-	shadow
-	missing-prototypes
-	missing-declarations
-	suggest-attribute=noreturn
-	suggest-attribute=format
-	strict-prototypes
-	declaration-after-statement
-	pointer-arith
-	write-strings
-	cast-align
-	bad-function-cast
-	missing-format-attribute
-	float-equal
-	format=2
-	format-signedness
-	format-security
-	format-nonliteral
-	no-long-long
-	unsigned-char
-	gnu89-inline
-	no-strict-aliasing
-	error
-	address
-	cpp
-	overflow
-	parentheses
-	sequence-point
-	switch
-	shift-overflow=2
-	overlength-strings
-	retundent-decls
-	init-self
-	uninitialized
-	unused-but-set-variable
-	unused-function
-	unused-result
-	unused-value
-	unused-variable
-	unknown-pragmas
-	no-unused-parameter
-	"
+# manual overrides
+# generates too much noise for stub APIs
+UNWANTED_CFLAGS="-Wno-unused-parameter"
 
-for j in $WARNLIST; do
-	if cc_supports_flag -W$j; then
-		EXTRA_WARNINGS="$EXTRA_WARNINGS -W$j";
-	fi
-done
+AC_SUBST([AM_CFLAGS],["$OPT_CFLAGS $GDB_FLAGS $DEFAULT_CFLAGS $UNWANTED_CFLAGS"])
 
-AC_SUBST([AM_CFLAGS],["$OPT_CFLAGS $GDB_FLAGS $EXTRA_WARNINGS"])
+AX_PROG_DATE
+AS_IF([test "$ax_cv_prog_date_gnu_date:$ax_cv_prog_date_gnu_utc" = yes:yes],
+	[UTC_DATE_AT="date -u -d@"],
+	[AS_IF([test "x$ax_cv_prog_date_bsd_date" = xyes],
+		[UTC_DATE_AT="date -u -r"],
+		[AC_MSG_ERROR([date utility unable to convert epoch to UTC])])])
+AC_SUBST([UTC_DATE_AT])
+
+AC_ARG_VAR([SOURCE_EPOCH],[last modification date of the source])
+AC_MSG_NOTICE([trying to determine source epoch])
+AC_MSG_CHECKING([for source epoch in \$SOURCE_EPOCH])
+AS_IF([test -n "$SOURCE_EPOCH"],
+	[AC_MSG_RESULT([yes])],
+	[AC_MSG_RESULT([no])
+	 AC_MSG_CHECKING([for source epoch in source_epoch file])
+	 AS_IF([test -e "$srcdir/source_epoch"],
+		[read SOURCE_EPOCH <"$srcdir/source_epoch"
+		 AC_MSG_RESULT([yes])],
+		[AC_MSG_RESULT([no])
+		 AC_MSG_CHECKING([for source epoch baked in by gitattributes export-subst])
+		 SOURCE_EPOCH='$Format:%at$' # template for rewriting by git-archive
+		 AS_CASE([$SOURCE_EPOCH],
+			[?Format:*], # was not rewritten
+				[AC_MSG_RESULT([no])
+				 AC_MSG_CHECKING([for source epoch in \$SOURCE_DATE_EPOCH])
+				 AS_IF([test "x$SOURCE_DATE_EPOCH" != x],
+					[SOURCE_EPOCH="$SOURCE_DATE_EPOCH"
+					 AC_MSG_RESULT([yes])],
+					[AC_MSG_RESULT([no])
+					 AC_MSG_CHECKING([whether git log can provide a source epoch])
+					 SOURCE_EPOCH=f${SOURCE_EPOCH#\$F} # convert into git log --pretty format
+					 SOURCE_EPOCH=$(cd "$srcdir" && git log -1 --pretty=${SOURCE_EPOCH%$} 2>/dev/null)
+					 AS_IF([test -n "$SOURCE_EPOCH"],
+						[AC_MSG_RESULT([yes])],
+						[AC_MSG_RESULT([no, using current time and breaking reproducibility])
+						 SOURCE_EPOCH=$(date +%s)])])],
+			[AC_MSG_RESULT([yes])]
+		 )])
+	])
+AC_MSG_NOTICE([using source epoch $($UTC_DATE_AT$SOURCE_EPOCH +'%F %T %Z')])
 
 AC_CONFIG_FILES([
 		Makefile
 		init/Makefile
-		libtap/Makefile
-		libtap/libtap.pc
+		libnozzle/Makefile
+		libnozzle/libnozzle.pc
+		libnozzle/tests/Makefile
 		kronosnetd/Makefile
 		kronosnetd/kronosnetd.logrotate
 		libknet/Makefile
@@ -466,9 +460,22 @@ AC_CONFIG_FILES([
 		libknet/tests/Makefile
 		man/Makefile
 		man/Doxyfile-knet
+		man/Doxyfile-nozzle
 		poc-code/Makefile
 		poc-code/iov-hash/Makefile
-		poc-code/access-list/Makefile
 		])
+
+if test "x$VERSION" = "xUNKNOWN"; then
+	AC_MSG_ERROR([m4_text_wrap([
+  configure was unable to determine the source tree's current version. This
+  generally happens when using git archive (or the github download button)
+  generated tarball/zip file. In order to workaround this issue, either use git
+  clone https://github.com/kronosnet/kronosnet.git or use an official release
+  tarball, available at https://kronosnet.org/releases/.  Alternatively you
+  can add a compatible version in a .tarball-version file at the top of the
+  source tree, wipe your autom4te.cache dir and generated configure, and rerun
+  autogen.sh.
+  ], [  ], [   ], [76])])
+fi
 
 AC_OUTPUT

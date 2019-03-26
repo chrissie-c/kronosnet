@@ -34,7 +34,7 @@ struct log_thread_data {
 };
 static struct log_thread_data data;
 static pthread_mutex_t shutdown_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int shutdown_in_progress = 0;
+static int stop_in_progress = 0;
 
 static int _read_pipe(int fd, char **file, size_t *length)
 {
@@ -217,60 +217,61 @@ void close_logpipes(int *logfds)
 
 void flush_logs(int logfd, FILE *std)
 {
-	struct knet_log_msg msg;
-	size_t bytes_read;
-	int len;
+	while (1) {
+		struct knet_log_msg msg;
 
-next:
-	len = 0;
-	bytes_read = 0;
-	memset(&msg, 0, sizeof(struct knet_log_msg));
-
-	while (bytes_read < sizeof(struct knet_log_msg)) {
-		len = read(logfd, &msg + bytes_read,
-			   sizeof(struct knet_log_msg) - bytes_read);
-		if (len <= 0) {
-			return;
+		for (size_t bytes_read = 0; bytes_read < sizeof(msg); ) {
+			int len = read(logfd, &msg + bytes_read,
+				       sizeof(msg) - bytes_read);
+			if (len <= 0) {
+				/*
+				 * clear errno to avoid incorrect propagation
+				 */
+				errno = 0;
+				return;
+			}
+			bytes_read += len;
 		}
-		bytes_read += len;
-	}
 
-	if (len > 0) {
-		fprintf(std, "[knet]: [%s] %s: %s\n",
+		if (!msg.knet_h) {
+			/*
+			 * this is harsh but this function is void
+			 * and it is used also inside log_thread.
+			 * this is the easiest to get out with an error
+			 */
+			fprintf(std, "NO HANDLE INFO IN LOG MSG!!\n");
+			abort();
+		}
+		fprintf(std, "[knet]: [%s] %s: %.*s\n",
 			knet_log_get_loglevel_name(msg.msglevel),
 			knet_log_get_subsystem_name(msg.subsystem),
-			msg.msg);
-		goto next;
+			KNET_MAX_LOG_MSG_SIZE, msg.msg);
 	}
 }
 
 static void *_logthread(void *args)
 {
-	fd_set rfds;
-	ssize_t len;
-	struct timeval tv;
+	while (1) {
+		int num;
+		struct timeval tv = { 60, 0 };
+		fd_set rfds;
 
-select_loop:
-	tv.tv_sec = 60;
-	tv.tv_usec = 0;
+		FD_ZERO(&rfds);
+		FD_SET(data.logfd, &rfds);
 
-	FD_ZERO(&rfds);
-	FD_SET(data.logfd, &rfds);
-
-	len = select(FD_SETSIZE, &rfds, NULL, NULL, &tv);
-	if (len < 0) {
-		fprintf(data.std, "Unable select over logfd!\nHALTING LOGTHREAD!\n");
-		return NULL;
+		num = select(FD_SETSIZE, &rfds, NULL, NULL, &tv);
+		if (num < 0) {
+			fprintf(data.std, "Unable select over logfd!\nHALTING LOGTHREAD!\n");
+			return NULL;
+		}
+		if (num == 0) {
+			fprintf(data.std, "[knet]: No logs in the last 60 seconds\n");
+			continue;
+		}
+		if (FD_ISSET(data.logfd, &rfds)) {
+			flush_logs(data.logfd, data.std);
+		}
 	}
-	if (!len) {
-		fprintf(data.std, "[knet]: No logs in the last 60 seconds\n");
-	}
-	if (FD_ISSET(data.logfd, &rfds)) {
-		flush_logs(data.logfd, data.std);
-	}
-	goto select_loop;
-
-	return NULL;
 }
 
 int start_logthread(int logfd, FILE *std)
@@ -361,7 +362,7 @@ int start_logging(FILE *std)
 
 knet_handle_t knet_handle_start(int logfds[2], uint8_t log_level)
 {
-	knet_handle_t knet_h = knet_handle_new_ex(1, logfds[1], log_level, 0);
+	knet_handle_t knet_h = knet_handle_new(1, logfds[1], log_level, 0);
 
 	if (knet_h) {
 		return knet_h;
@@ -388,13 +389,13 @@ int knet_handle_stop(knet_handle_t knet_h)
 		return -1;
 	}
 
-	if (shutdown_in_progress) {
+	if (stop_in_progress) {
 		pthread_mutex_unlock(&shutdown_mutex);
 		errno = EINVAL;
 		return -1;
 	}
 
-	shutdown_in_progress = 1;
+	stop_in_progress = 1;
 
 	pthread_mutex_unlock(&shutdown_mutex);
 
@@ -439,7 +440,7 @@ int knet_handle_stop(knet_handle_t knet_h)
 	return 0;
 }
 
-int make_local_sockaddr(struct sockaddr_storage *lo, uint16_t offset)
+static int _make_local_sockaddr(struct sockaddr_storage *lo, uint16_t offset, int family)
 {
 	uint32_t port;
 	char portstr[32];
@@ -456,7 +457,20 @@ int make_local_sockaddr(struct sockaddr_storage *lo, uint16_t offset)
 	memset(lo, 0, sizeof(struct sockaddr_storage));
 	printf("Using port %u\n", port);
 
+	if (family == AF_INET6) {
+		return knet_strtoaddr("::1", portstr, lo, sizeof(struct sockaddr_storage));
+	}
 	return knet_strtoaddr("127.0.0.1", portstr, lo, sizeof(struct sockaddr_storage));
+}
+
+int make_local_sockaddr(struct sockaddr_storage *lo, uint16_t offset)
+{
+	return _make_local_sockaddr(lo, offset, AF_INET);
+}
+
+int make_local_sockaddr6(struct sockaddr_storage *lo, uint16_t offset)
+{
+	return _make_local_sockaddr(lo, offset, AF_INET6);
 }
 
 int wait_for_host(knet_handle_t knet_h, uint16_t host_id, int seconds, int logfd, FILE *std)
@@ -484,13 +498,14 @@ int wait_for_packet(knet_handle_t knet_h, int seconds, int datafd)
 {
 	fd_set rfds;
 	struct timeval tv;
-	int err = 0;
+	int err = 0, i = 0;
 
 	if (is_memcheck() || is_helgrind()) {
 		printf("Test suite is running under valgrind, adjusting wait_for_packet timeout\n");
 		seconds = seconds * 16;
 	}
 
+try_again:
 	FD_ZERO(&rfds);
 	FD_SET(datafd, &rfds);
 
@@ -498,6 +513,15 @@ int wait_for_packet(knet_handle_t knet_h, int seconds, int datafd)
 	tv.tv_usec = 0;
 
 	err = select(datafd+1, &rfds, NULL, NULL, &tv);
+	/*
+	 * on slow arches the first call to select can return 0.
+	 * pick an arbitrary 10 times loop (multiplied by waiting seconds)
+	 * before failing.
+	 */
+	if ((!err) && (i < 10)) {
+		i++;
+		goto try_again;
+	}
 	if ((err > 0) && (FD_ISSET(datafd, &rfds))) {
 		return 0;
 	}

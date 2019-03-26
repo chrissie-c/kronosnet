@@ -80,7 +80,12 @@ static int _init_locks(knet_handle_t knet_h)
 		goto exit_fail;
 	}
 
-	knet_h->lock_init_done = 1;
+	savederrno = pthread_mutex_init(&knet_h->threads_status_mutex, NULL);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_HANDLE, "Unable to initialize threads status mutex: %s",
+			strerror(savederrno));
+		goto exit_fail;
+	}
 
 	savederrno = pthread_mutex_init(&knet_h->pmtud_mutex, NULL);
 	if (savederrno) {
@@ -140,7 +145,6 @@ exit_fail:
 
 static void _destroy_locks(knet_handle_t knet_h)
 {
-	knet_h->lock_init_done = 0;
 	pthread_rwlock_destroy(&knet_h->global_rwlock);
 	pthread_mutex_destroy(&knet_h->pmtud_mutex);
 	pthread_mutex_destroy(&knet_h->kmtu_mutex);
@@ -149,6 +153,7 @@ static void _destroy_locks(knet_handle_t knet_h)
 	pthread_mutex_destroy(&knet_h->tx_mutex);
 	pthread_mutex_destroy(&knet_h->backoff_mutex);
 	pthread_mutex_destroy(&knet_h->tx_seq_num_mutex);
+	pthread_mutex_destroy(&knet_h->threads_status_mutex);
 }
 
 static int _init_socks(knet_handle_t knet_h)
@@ -304,7 +309,10 @@ static int _init_buffers(knet_handle_t knet_h)
 	}
 	memset(knet_h->send_to_links_buf_compress, 0, KNET_DATABUFSIZE_COMPRESS);
 
-	memset(knet_h->knet_transport_fd_tracker, KNET_MAX_TRANSPORTS, sizeof(knet_h->knet_transport_fd_tracker));
+	memset(knet_h->knet_transport_fd_tracker, 0, sizeof(knet_h->knet_transport_fd_tracker));
+	for (i = 0; i < KNET_MAX_FDS; i++) {
+		knet_h->knet_transport_fd_tracker[i].transport = KNET_MAX_TRANSPORTS;
+	}
 
 	return 0;
 
@@ -449,6 +457,7 @@ static int _start_threads(knet_handle_t knet_h)
 {
 	int savederrno = 0;
 
+	set_thread_status(knet_h, KNET_THREAD_PMTUD, KNET_THREAD_REGISTERED);
 	savederrno = pthread_create(&knet_h->pmtud_link_handler_thread, 0,
 				    _handle_pmtud_link_thread, (void *) knet_h);
 	if (savederrno) {
@@ -457,6 +466,7 @@ static int _start_threads(knet_handle_t knet_h)
 		goto exit_fail;
 	}
 
+	set_thread_status(knet_h, KNET_THREAD_DST_LINK, KNET_THREAD_REGISTERED);
 	savederrno = pthread_create(&knet_h->dst_link_handler_thread, 0,
 				    _handle_dst_link_handler_thread, (void *) knet_h);
 	if (savederrno) {
@@ -465,6 +475,7 @@ static int _start_threads(knet_handle_t knet_h)
 		goto exit_fail;
 	}
 
+	set_thread_status(knet_h, KNET_THREAD_TX, KNET_THREAD_REGISTERED);
 	savederrno = pthread_create(&knet_h->send_to_links_thread, 0,
 				    _handle_send_to_links_thread, (void *) knet_h);
 	if (savederrno) {
@@ -473,6 +484,7 @@ static int _start_threads(knet_handle_t knet_h)
 		goto exit_fail;
 	}
 
+	set_thread_status(knet_h, KNET_THREAD_RX, KNET_THREAD_REGISTERED);
 	savederrno = pthread_create(&knet_h->recv_from_links_thread, 0,
 				    _handle_recv_from_links_thread, (void *) knet_h);
 	if (savederrno) {
@@ -481,6 +493,7 @@ static int _start_threads(knet_handle_t knet_h)
 		goto exit_fail;
 	}
 
+	set_thread_status(knet_h, KNET_THREAD_HB, KNET_THREAD_REGISTERED);
 	savederrno = pthread_create(&knet_h->heartbt_thread, 0,
 				    _handle_heartbt_thread, (void *) knet_h);
 	if (savederrno) {
@@ -488,6 +501,7 @@ static int _start_threads(knet_handle_t knet_h)
 			strerror(savederrno));
 		goto exit_fail;
 	}
+
 	return 0;
 
 exit_fail:
@@ -499,14 +513,7 @@ static void _stop_threads(knet_handle_t knet_h)
 {
 	void *retval;
 
-	/*
-	 * allow threads to catch on shutdown request
-	 * and release locks before we stop them.
-	 * this isn't the most efficent way to handle it
-	 * but it works good enough for now
-	 */
-
-	sleep(1);
+	wait_all_threads_status(knet_h, KNET_THREAD_STOPPED);
 
 	if (knet_h->heartbt_thread) {
 		pthread_cancel(knet_h->heartbt_thread);
@@ -534,10 +541,10 @@ static void _stop_threads(knet_handle_t knet_h)
 	}
 }
 
-knet_handle_t knet_handle_new_ex(knet_node_id_t host_id,
-				 int            log_fd,
-				 uint8_t        default_log_level,
-				 uint64_t       flags)
+knet_handle_t knet_handle_new(knet_node_id_t host_id,
+			      int            log_fd,
+			      uint8_t        default_log_level,
+			      uint64_t       flags)
 {
 	knet_handle_t knet_h;
 	int savederrno = 0;
@@ -577,15 +584,13 @@ knet_handle_t knet_handle_new_ex(knet_node_id_t host_id,
 	}
 	memset(knet_h, 0, sizeof(struct knet_handle));
 
-	knet_h->flags = flags;
+	/*
+	 * setting up some handle data so that we can use logging
+	 * also when initializing the library global locks
+	 * and trackers
+	 */
 
-	savederrno = pthread_mutex_lock(&handle_config_mutex);
-	if (savederrno) {
-		log_err(knet_h, KNET_SUB_HANDLE, "Unable to get handle mutex lock: %s",
-			strerror(savederrno));
-		errno = savederrno;
-		goto exit_fail;
-	}
+	knet_h->flags = flags;
 
 	/*
 	 * copy config in place
@@ -596,6 +601,12 @@ knet_handle_t knet_handle_new_ex(knet_node_id_t host_id,
 	if (knet_h->logfd > 0) {
 		memset(&knet_h->log_levels, default_log_level, KNET_MAX_SUBSYSTEMS);
 	}
+
+	/*
+	 * set internal threads time resolutions
+	 */
+
+	knet_h->threads_timer_res = KNET_THREADS_TIMER_RES;
 
 	/*
 	 * set pmtud default timers
@@ -619,6 +630,18 @@ knet_handle_t knet_handle_new_ex(knet_node_id_t host_id,
 	/*
 	 * init global shlib tracker
 	 */
+	savederrno = pthread_mutex_lock(&handle_config_mutex);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_HANDLE, "Unable to get handle mutex lock: %s",
+			strerror(savederrno));
+		free(knet_h);
+		knet_h = NULL;
+		errno = savederrno;
+		return NULL;
+	}
+
+	knet_ref++;
+
 	if (_init_shlib_tracker(knet_h) < 0) {
 		savederrno = errno;
 		log_err(knet_h, KNET_SUB_HANDLE, "Unable to init handles traceker: %s",
@@ -626,6 +649,8 @@ knet_handle_t knet_handle_new_ex(knet_node_id_t host_id,
 		errno = savederrno;
 		goto exit_fail;
 	}
+
+	pthread_mutex_unlock(&handle_config_mutex);
 
 	/*
 	 * init main locking structures
@@ -686,52 +711,30 @@ knet_handle_t knet_handle_new_ex(knet_node_id_t host_id,
 		goto exit_fail;
 	}
 
-	knet_ref++;
+	wait_all_threads_status(knet_h, KNET_THREAD_STARTED);
 
-	pthread_mutex_unlock(&handle_config_mutex);
+	errno = 0;
 	return knet_h;
 
 exit_fail:
-	pthread_mutex_unlock(&handle_config_mutex);
 	knet_handle_free(knet_h);
 	errno = savederrno;
 	return NULL;
-}
-
-knet_handle_t knet_handle_new(knet_node_id_t host_id,
-			      int            log_fd,
-			      uint8_t        default_log_level)
-{
-	return knet_handle_new_ex(host_id, log_fd, default_log_level, KNET_HANDLE_FLAG_PRIVILEGED);
 }
 
 int knet_handle_free(knet_handle_t knet_h)
 {
 	int savederrno = 0;
 
-	savederrno = pthread_mutex_lock(&handle_config_mutex);
-	if (savederrno) {
-		log_err(knet_h, KNET_SUB_HANDLE, "Unable to get handle mutex lock: %s",
-			strerror(savederrno));
-		errno = savederrno;
-		return -1;
-	}
-
 	if (!knet_h) {
-		pthread_mutex_unlock(&handle_config_mutex);
 		errno = EINVAL;
 		return -1;
-	}
-
-	if (!knet_h->lock_init_done) {
-		goto exit_nolock;
 	}
 
 	savederrno = get_global_wrlock(knet_h);
 	if (savederrno) {
 		log_err(knet_h, KNET_SUB_HANDLE, "Unable to get write lock: %s",
 			strerror(savederrno));
-		pthread_mutex_unlock(&handle_config_mutex);
 		errno = savederrno;
 		return -1;
 	}
@@ -742,7 +745,6 @@ int knet_handle_free(knet_handle_t knet_h)
 			"Unable to free handle: host(s) or listener(s) are still active: %s",
 			strerror(savederrno));
 		pthread_rwlock_unlock(&knet_h->global_rwlock);
-		pthread_mutex_unlock(&handle_config_mutex);
 		errno = savederrno;
 		return -1;
 	}
@@ -760,12 +762,15 @@ int knet_handle_free(knet_handle_t knet_h)
 	compress_fini(knet_h, 1);
 	_destroy_locks(knet_h);
 
-exit_nolock:
 	free(knet_h);
 	knet_h = NULL;
+
+	(void)pthread_mutex_lock(&handle_config_mutex);
 	knet_ref--;
 	_fini_shlib_tracker();
 	pthread_mutex_unlock(&handle_config_mutex);
+
+	errno = 0;
 	return 0;
 }
 
@@ -805,6 +810,7 @@ int knet_handle_enable_sock_notify(knet_handle_t knet_h,
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -945,7 +951,7 @@ int knet_handle_add_datafd(knet_handle_t knet_h, int *datafd, int8_t *channel)
 
 out_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1009,7 +1015,7 @@ int knet_handle_remove_datafd(knet_handle_t knet_h, int datafd)
 
 out_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1050,7 +1056,7 @@ int knet_handle_get_datafd(knet_handle_t knet_h, const int8_t channel, int *data
 
 out_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1100,7 +1106,7 @@ int knet_handle_get_channel(knet_handle_t knet_h, const int datafd, int8_t *chan
 
 out_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1142,6 +1148,7 @@ int knet_handle_enable_filter(knet_handle_t knet_h,
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = 0;
 	return 0;
 }
 
@@ -1177,6 +1184,43 @@ int knet_handle_setfwd(knet_handle_t knet_h, unsigned int enabled)
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = 0;
+	return 0;
+}
+
+int knet_handle_enable_access_lists(knet_handle_t knet_h, unsigned int enabled)
+{
+	int savederrno = 0;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (enabled > 1) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = get_global_wrlock(knet_h);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_HANDLE, "Unable to get write lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	knet_h->use_access_lists = enabled;
+
+	if (enabled) {
+		log_debug(knet_h, KNET_SUB_HANDLE, "Links access lists are enabled");
+	} else {
+		log_debug(knet_h, KNET_SUB_HANDLE, "Links access lists are disabled");
+	}
+
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+
+	errno = 0;
 	return 0;
 }
 
@@ -1206,6 +1250,7 @@ int knet_handle_pmtud_getfreq(knet_handle_t knet_h, unsigned int *interval)
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = 0;
 	return 0;
 }
 
@@ -1236,6 +1281,7 @@ int knet_handle_pmtud_setfreq(knet_handle_t knet_h, unsigned int interval)
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = 0;
 	return 0;
 }
 
@@ -1270,6 +1316,7 @@ int knet_handle_enable_pmtud_notify(knet_handle_t knet_h,
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = 0;
 	return 0;
 }
 
@@ -1300,6 +1347,7 @@ int knet_handle_pmtud_get(knet_handle_t knet_h,
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
 
+	errno = 0;
 	return 0;
 }
 
@@ -1361,7 +1409,7 @@ int knet_handle_crypto(knet_handle_t knet_h, struct knet_handle_crypto_cfg *knet
 
 exit_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1393,7 +1441,7 @@ int knet_handle_compress(knet_handle_t knet_h, struct knet_handle_compress_cfg *
 	savederrno = errno;
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1456,7 +1504,7 @@ ssize_t knet_recv(knet_handle_t knet_h, char *buff, const size_t buff_len, const
 
 out_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1520,7 +1568,7 @@ ssize_t knet_send(knet_handle_t knet_h, const char *buff, const size_t buff_len,
 
 out_unlock:
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1567,7 +1615,7 @@ int knet_handle_get_stats(knet_handle_t knet_h, struct knet_handle_stats *stats,
 	stats->size = sizeof(struct knet_handle_stats);
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
@@ -1602,7 +1650,79 @@ int knet_handle_clear_stats(knet_handle_t knet_h, int clear_option)
 	}
 
 	pthread_rwlock_unlock(&knet_h->global_rwlock);
-	errno = savederrno;
+	errno = err ? savederrno : 0;
 	return err;
 }
 
+int knet_handle_set_threads_timer_res(knet_handle_t knet_h,
+				      useconds_t timeres)
+{
+	int savederrno = 0;
+	int err = 0;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/*
+	 * most threads use timeres / 1000 as timeout on epoll.
+	 * anything below 1000 would generate a result of 0, making
+	 * the threads spin at 100% cpu
+	 */
+	if ((timeres > 0) && (timeres < 1000)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = get_global_wrlock(knet_h);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_HANDLE, "Unable to get write lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	if (timeres) {
+		knet_h->threads_timer_res = timeres;
+		log_debug(knet_h, KNET_SUB_HANDLE, "Setting new threads timer resolution to %u usecs", knet_h->threads_timer_res);
+	} else {
+		knet_h->threads_timer_res = KNET_THREADS_TIMER_RES;
+		log_debug(knet_h, KNET_SUB_HANDLE, "Setting new threads timer resolution to default %u usecs", knet_h->threads_timer_res);
+	}
+
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+	errno = err ? savederrno : 0;
+	return err;
+}
+
+int knet_handle_get_threads_timer_res(knet_handle_t knet_h,
+				      useconds_t *timeres)
+{
+	int savederrno = 0;
+	int err = 0;
+
+	if (!knet_h) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (!timeres) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	savederrno = pthread_rwlock_rdlock(&knet_h->global_rwlock);
+	if (savederrno) {
+		log_err(knet_h, KNET_SUB_HANDLE, "Unable to get read lock: %s",
+			strerror(savederrno));
+		errno = savederrno;
+		return -1;
+	}
+
+	*timeres = knet_h->threads_timer_res;
+
+	pthread_rwlock_unlock(&knet_h->global_rwlock);
+	errno = err ? savederrno : 0;
+	return err;
+}

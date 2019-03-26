@@ -20,6 +20,7 @@
 #include "crypto.h"
 #include "host.h"
 #include "links.h"
+#include "links_acl.h"
 #include "logging.h"
 #include "transports.h"
 #include "transport_common.h"
@@ -409,6 +410,7 @@ static void _parse_recv_from_links(knet_handle_t knet_h, int sockfd, const struc
 				memmove(inbuf->khp_data_userdata, knet_h->recv_from_links_buf_decompress, decmp_outlen);
 				len = decmp_outlen + KNET_HEADER_DATA_SIZE;
 			} else {
+				knet_h->stats.rx_failed_to_decompress++;
 				log_warn(knet_h, KNET_SUB_COMPRESS, "Unable to decompress packet (%d): %s",
 					 err, strerror(errno));
 				return;
@@ -566,7 +568,7 @@ static void _parse_recv_from_links(knet_handle_t knet_h, int sockfd, const struc
 		if (knet_h->crypto_instance) {
 			if (crypto_encrypt_and_sign(knet_h,
 						    (const unsigned char *)inbuf,
-						    len,
+						    outlen,
 						    knet_h->recv_from_links_buf_crypt,
 						    &outlen) < 0) {
 				log_debug(knet_h, KNET_SUB_RX, "Unable to encrypt pong packet");
@@ -577,12 +579,15 @@ static void _parse_recv_from_links(knet_handle_t knet_h, int sockfd, const struc
 		}
 
 retry_pong:
-		len = sendto(src_link->outsock, outbuf, outlen, MSG_DONTWAIT | MSG_NOSIGNAL,
-				(struct sockaddr *) &src_link->dst_addr,
-				sizeof(struct sockaddr_storage));
+		if (transport_get_connection_oriented(knet_h, src_link->transport) == TRANSPORT_PROTO_NOT_CONNECTION_ORIENTED) {
+			len = sendto(src_link->outsock, outbuf, outlen, MSG_DONTWAIT | MSG_NOSIGNAL,
+				     (struct sockaddr *) &src_link->dst_addr, sizeof(struct sockaddr_storage));
+		} else {
+			len = sendto(src_link->outsock, outbuf, outlen, MSG_DONTWAIT | MSG_NOSIGNAL, NULL, 0);
+		}
 		savederrno = errno;
 		if (len != outlen) {
-			err = transport_tx_sock_error(knet_h, src_link->transport_type, src_link->outsock, len, savederrno);
+			err = transport_tx_sock_error(knet_h, src_link->transport, src_link->outsock, len, savederrno);
 			switch(err) {
 				case -1: /* unrecoverable error */
 					log_debug(knet_h, KNET_SUB_RX,
@@ -654,7 +659,7 @@ retry_pong:
 		if (knet_h->crypto_instance) {
 			if (crypto_encrypt_and_sign(knet_h,
 						    (const unsigned char *)inbuf,
-						    len,
+						    outlen,
 						    knet_h->recv_from_links_buf_crypt,
 						    &outlen) < 0) {
 				log_debug(knet_h, KNET_SUB_RX, "Unable to encrypt PMTUd reply packet");
@@ -670,12 +675,15 @@ retry_pong:
 			goto out_pmtud;
 		}
 retry_pmtud:
-		len = sendto(src_link->outsock, outbuf, outlen, MSG_DONTWAIT | MSG_NOSIGNAL,
-				(struct sockaddr *) &src_link->dst_addr,
-				sizeof(struct sockaddr_storage));
+		if (transport_get_connection_oriented(knet_h, src_link->transport) == TRANSPORT_PROTO_NOT_CONNECTION_ORIENTED) {
+			len = sendto(src_link->outsock, outbuf, outlen, MSG_DONTWAIT | MSG_NOSIGNAL,
+				     (struct sockaddr *) &src_link->dst_addr, sizeof(struct sockaddr_storage));
+		} else {
+			len = sendto(src_link->outsock, outbuf, outlen, MSG_DONTWAIT | MSG_NOSIGNAL, NULL, 0);
+		}
 		savederrno = errno;
 		if (len != outlen) {
-			err = transport_tx_sock_error(knet_h, src_link->transport_type, src_link->outsock, len, savederrno);
+			err = transport_tx_sock_error(knet_h, src_link->transport, src_link->outsock, len, savederrno);
 			switch(err) {
 				case -1: /* unrecoverable error */
 					log_debug(knet_h, KNET_SUB_RX,
@@ -796,6 +804,28 @@ static void _handle_recv_from_links(knet_handle_t knet_h, int sockfd, struct kne
 				goto exit_unlock;
 				break;
 			case 2: /* packet is data and should be parsed as such */
+				/*
+				 * processing incoming packets vs access lists
+				 */
+				if ((knet_h->use_access_lists) &&
+				    (transport_get_acl_type(knet_h, transport) == USE_GENERIC_ACL)) {
+					if (!check_validate(knet_h, sockfd, transport, msg[i].msg_hdr.msg_name)) {
+						char src_ipaddr[KNET_MAX_HOST_LEN];
+						char src_port[KNET_MAX_PORT_LEN];
+
+						memset(src_ipaddr, 0, KNET_MAX_HOST_LEN);
+						memset(src_port, 0, KNET_MAX_PORT_LEN);
+						knet_addrtostr(msg[i].msg_hdr.msg_name, sockaddr_len(msg[i].msg_hdr.msg_name),
+							       src_ipaddr, KNET_MAX_HOST_LEN,
+							       src_port, KNET_MAX_PORT_LEN);
+
+						log_debug(knet_h, KNET_SUB_RX, "Packet rejected from %s/%s", src_ipaddr, src_port);
+						/*
+						 * continue processing the other packets
+						 */
+						continue;
+					}
+				}
 				_parse_recv_from_links(knet_h, sockfd, &msg[i]);
 				break;
 		}
@@ -814,6 +844,8 @@ void *_handle_recv_from_links_thread(void *data)
 	struct knet_mmsghdr msg[PCKT_RX_BUFS];
 	struct iovec iov_in[PCKT_RX_BUFS];
 
+	set_thread_status(knet_h, KNET_THREAD_RX, KNET_THREAD_STARTED);
+
 	memset(&msg, 0, sizeof(msg));
 
 	for (i = 0; i < PCKT_RX_BUFS; i++) {
@@ -829,12 +861,21 @@ void *_handle_recv_from_links_thread(void *data)
 	}
 
 	while (!shutdown_in_progress(knet_h)) {
-		nev = epoll_wait(knet_h->recv_from_links_epollfd, events, KNET_EPOLL_MAX_EVENTS, -1);
+		nev = epoll_wait(knet_h->recv_from_links_epollfd, events, KNET_EPOLL_MAX_EVENTS, knet_h->threads_timer_res / 1000);
+
+		/*
+		 * we use timeout to detect if thread is shutting down
+		 */
+		if (nev == 0) {
+			continue;
+		}
 
 		for (i = 0; i < nev; i++) {
 			_handle_recv_from_links(knet_h, events[i].data.fd, msg);
 		}
 	}
+
+	set_thread_status(knet_h, KNET_THREAD_RX, KNET_THREAD_STOPPED);
 
 	return NULL;
 }
