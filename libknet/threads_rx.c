@@ -573,25 +573,30 @@ static int _check_destination(knet_handle_t knet_h, struct knet_header *inbuf, u
 	return 0;
 }
 
-static int _deliver_data(knet_handle_t knet_h, unsigned char *data, ssize_t len, ssize_t header_size, int8_t channel)
+static int _deliver_data(knet_handle_t knet_h, unsigned char *data, ssize_t len, ssize_t header_size, int8_t channel, const struct knet_mmsghdr *msg)
 {
-	struct iovec iov_out[1];
+	struct iovec iov_out[2];
 	ssize_t	outlen = 0;
+	uint32_t cur_iov = 0;
+	char hdr_buf[KNET_MAX_FD_HEADER_SIZE];
+	int hdr_len = 0;
 
 	memset(iov_out, 0, sizeof(iov_out));
 
-retry:
-	iov_out[0].iov_base = (void *) data + outlen;
-	iov_out[0].iov_len = len - (outlen + header_size);
-
-	outlen = writev(knet_h->sockfd[channel].sockfd[knet_h->sockfd[channel].is_created], iov_out, 1);
-	if ((outlen > 0) && (outlen < (ssize_t)iov_out[0].iov_len)) {
-		log_debug(knet_h, KNET_SUB_RX,
-			  "Unable to send all data to the application in one go. Expected: %zu Sent: %zd\n",
-			  iov_out[0].iov_len, outlen);
-		goto retry;
+	/* Add any header info if requested */
+#ifdef KNET_DATAFD_FLAG_RX_RETURN_INFO
+	if (knet_h->sockfd[channel].flags & KNET_DATAFD_FLAG_RX_RETURN_INFO) {
+ 		hdr_len = knet_buffer_add_data_item(hdr_buf, sizeof(hdr_buf), KNET_FDHEADER_IPADDR, msg->msg_hdr.msg_name, msg->msg_hdr.msg_namelen);
+		hdr_len += knet_buffer_add_data_item(hdr_buf+hdr_len, sizeof(hdr_buf), KNET_FDHEADER_END, NULL, 0);
+		iov_out[0].iov_base = &hdr_buf;
+		iov_out[0].iov_len = hdr_len;
+		cur_iov++;
 	}
+#endif
+	iov_out[cur_iov].iov_base = (void *) data + outlen;
+	iov_out[cur_iov].iov_len = len - (outlen + header_size);
 
+	outlen = writev_all(knet_h->sockfd[channel].sockfd[knet_h->sockfd[channel].is_created], iov_out, cur_iov+1, NULL);
 	if (outlen <= 0) {
 		knet_h->sock_notify_fn(knet_h->sock_notify_fn_private_data,
 				       knet_h->sockfd[channel].sockfd[0],
@@ -620,7 +625,7 @@ static int _fast_data_up(knet_handle_t knet_h, struct knet_host *src_host, struc
 	return 0;
 }
 
-static void _process_data(knet_handle_t knet_h, struct knet_host *src_host, struct knet_link *src_link, struct knet_header *inbuf, ssize_t len, uint64_t decrypt_time)
+static void _process_data(knet_handle_t knet_h, struct knet_host *src_host, struct knet_link *src_link, struct knet_header *inbuf, ssize_t len, uint64_t decrypt_time, const struct knet_mmsghdr *msg)
 {
 	int8_t channel;
        	uint8_t decompress_type = 0;
@@ -716,7 +721,7 @@ static void _process_data(knet_handle_t knet_h, struct knet_host *src_host, stru
 	}
 #endif
 
-	if (_deliver_data(knet_h, data, len, header_size, channel) < 0) {
+	if (_deliver_data(knet_h, data, len, header_size, channel, msg) < 0) {
 		return;
 	}
 
@@ -992,7 +997,7 @@ static void _parse_recv_from_links(knet_handle_t knet_h, int sockfd, const struc
 
 	switch (inbuf->kh_type) {
 		case KNET_HEADER_TYPE_DATA:
-			_process_data(knet_h, src_host, src_link, inbuf, len, decrypt_time);
+			_process_data(knet_h, src_host, src_link, inbuf, len, decrypt_time, msg);
 			break;
 		case KNET_HEADER_TYPE_PING:
 			process_ping(knet_h, src_host, src_link, inbuf, len);

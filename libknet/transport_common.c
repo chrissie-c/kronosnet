@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 
@@ -445,4 +446,84 @@ int _set_fd_tracker(knet_handle_t knet_h, int sockfd, uint8_t transport, uint8_t
 	knet_h->knet_transport_fd_tracker[sockfd].ifindex = ifindex;
 
 	return 0;
+}
+
+/*
+ * Wrapper function for writev that retries until all data is written.
+ */
+ssize_t writev_all(int fd, struct iovec *iov, int iovcnt, struct knet_link *local_link)
+{
+    ssize_t total_written = 0;  // Total bytes written
+    ssize_t result;
+
+    while (iovcnt > 0) {
+	    result = writev(fd, iov, iovcnt);
+	    if (result < 0) {
+		    /* retry on signal */
+		    if (errno == EINTR) {
+			    continue;
+		    }
+		    /* Other errors */
+		    return -1;
+	    }
+
+	    total_written += result;
+
+	    /* Adjust iovec array to account for the bytes already written */
+	    size_t bytes_left = result;
+	    int old_iovcnt = iovcnt;
+	    for (int i = 0; i < old_iovcnt; i++) {
+		    if (bytes_left >= iov[i].iov_len) {
+			    bytes_left -= iov[i].iov_len;
+			    iov++;
+			    iovcnt--;
+			    if (local_link != NULL) {
+				    local_link->status.stats.tx_data_retries++;
+			    }
+		    } else {
+			    /* Adjust the current iovec to start at the remaining data */
+			    iov[i].iov_base = (char *)iov[i].iov_base + bytes_left;
+			    iov[i].iov_len -= bytes_left;
+			    break;
+		    }
+	    }
+    }
+
+    return total_written;
+}
+
+/*
+ * Helper functions for the additional datafd info
+ * These are made available to applications to maybe need to go elsewhere?
+ */
+ssize_t knet_buffer_add_data_item(char *buf, size_t buflen, uint8_t datatype, const void *data, size_t datalen)
+{
+	if (datalen+2 > buflen) {
+		return -1;
+	}
+
+	buf[0] = datatype;
+	buf[1] = datalen;
+	if (datalen > 0 && data != NULL) {
+		memcpy(&buf[2], data, datalen);
+	}
+
+	return datalen+2;
+}
+
+// Actual datalen needs to be filled in first
+ssize_t knet_buffer_get_data_item(const unsigned char *buf, size_t buflen, uint8_t *datatype, void *data, size_t *datalen)
+{
+	size_t actual_datalen;
+	*datatype = buf[0];
+	actual_datalen = buf[1];
+
+	if (actual_datalen > *datalen) {
+		*datalen = 0; /* not returned */
+		return actual_datalen+2;
+	}
+	*datalen = actual_datalen;
+	memcpy(data, &buf[2], actual_datalen);
+
+	return actual_datalen+2;
 }

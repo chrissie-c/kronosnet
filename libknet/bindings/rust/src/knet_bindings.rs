@@ -81,6 +81,15 @@ bitflags! {
 }
 
 bitflags! {
+/// Flags passed into [handle_add_datafd_new]
+    pub struct DataFdFlags: u32
+    {
+        const KNET_DATAFD_FLAG_RX_RETURN_INFO = 1;
+        const KNET_DATAFD_FLAG_TX_PROVIDE_INFO = 2;
+    }
+}
+
+bitflags! {
 /// Flags passed into [link_set_config]
     pub struct LinkFlags: u64
     {
@@ -543,6 +552,24 @@ pub fn handle_add_datafd(handle: &Handle, datafd: i32, channel: i8) -> Result<(i
 	ffi::knet_handle_add_datafd(handle.knet_handle as ffi::knet_handle_t,
 				    &mut c_datafd,
 				    &mut c_channel)
+    };
+    if res == 0 {
+	Ok((c_datafd, c_channel))
+    } else {
+	Err(Error::last_os_error())
+    }
+}
+
+/// Add a data FD to knet (with flags). if datafd is 0 then knet will allocate one for you.
+pub fn handle_add_datafd_new(handle: &Handle, datafd: i32, channel: i8, flags: DataFdFlags) -> Result<(i32, i8)>
+{
+    let mut c_datafd = datafd;
+    let mut c_channel = channel;
+    let res = unsafe {
+	ffi::knet_handle_add_datafd_new(handle.knet_handle as ffi::knet_handle_t,
+				        &mut c_datafd,
+				        &mut c_channel,
+					flags.bits())
     };
     if res == 0 {
 	Ok((c_datafd, c_channel))

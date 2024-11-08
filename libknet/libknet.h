@@ -92,6 +92,26 @@ typedef uint16_t knet_node_id_t;
 #define KNET_HANDLE_FLAG_PRIVILEGED (1ULL << 0)
 
 /*
+ * Flags that affect what appears (and should be provided) on the datafd
+ */
+#define KNET_DATAFD_FLAG_RX_RETURN_INFO  (1ULL << 0)
+#define KNET_DATAFD_FLAG_TX_PROVIDE_INFO (2ULL << 0)
+
+/*
+ * Data items passed back if RETURN_INFO is set on an fd
+ */
+#define KNET_FDHEADER_IPADDR  1
+#define KNET_FDHEADER_NODEID  2
+#define KNET_FDHEADER_CHANNEL 3
+#define KNET_FDHEADER_END     127
+
+/* Maxximum size of the whole header */
+#define KNET_MAX_FD_HEADER_SIZE 1024
+
+/* Maximum size of an item in the header */
+#define KNET_MAX_FD_HEADER_ITEM_SIZE sizeof(struct sockaddr_storage)
+
+/*
  * threads timer resolution (see knet_handle_set_threads_timer_res below)
  */
 
@@ -331,6 +351,76 @@ int knet_handle_enable_sock_notify(knet_handle_t knet_h,
  *         *datafd and *channel are untouched or empty.
  */
 
+int knet_handle_add_datafd_new(knet_handle_t knet_h, int *datafd, int8_t *channel, uint32_t flags);
+/**
+ * knet_handle_add_datafd_new
+ *
+ * @brief Install a file descriptor for communication
+ *
+ * IMPORTANT: In order to add datafd to knet, knet_handle_enable_sock_notify
+ *            _MUST_ be set and be able to handle both errors (-1) and
+ *            0 bytes read / write from the provided datafd.
+ *            On read error (< 0) from datafd, the socket is automatically
+ *            removed from polling to avoid spinning on dead sockets.
+ *            It is safe to call knet_handle_remove_datafd even on sockets
+ *            that have been removed.
+ *
+ * knet_h   - pointer to knet_handle_t
+ *
+ * *datafd  - read/write file descriptor.
+ *            knet will read data here to send to the other hosts
+ *            and will write data received from the network.
+ *            Each data packet can be of max size KNET_MAX_PACKET_SIZE!
+ *            Applications using knet_send/knet_recv will receive a
+ *            proper error if the packet size is not within boundaries.
+ *            Applications using their own functions to write to the
+ *            datafd should NOT write more than KNET_MAX_PACKET_SIZE.
+ *
+ *            Please refer to handle.c on how to set up a socketpair.
+ *
+ *            datafd can be 0, and knet_handle_add_datafd will create a properly
+ *            populated socket pair the same way as ping_test, or a value
+ *            higher than 0. A negative number will return an error.
+ *            On exit knet_handle_free will take care to cleanup the
+ *            socketpair only if they have been created by knet_handle_add_datafd.
+ *
+ *            It is possible to pass either sockets or normal fds.
+ *            User provided datafd will be marked as non-blocking and close-on-exec.
+ *
+ * *channel - This value is analogous to the tag in VLAN tagging.
+ *            A negative value will auto-allocate a channel.
+ *            Setting a value between 0 and 31 will try to allocate that
+ *            specific channel (unless already in use).
+ *
+ *            It is possible to add up to 32 datafds but be aware that each
+ *            one of them must have a receiving end on the other host.
+ *
+ *            Example:
+ *            hostA channel 0 will be delivered to datafd on hostB channel 0
+ *            hostA channel 1 to hostB channel 1.
+ *
+ *            Each channel must have a unique file descriptor.
+ *
+ *            If your application could have 2 channels on one host and one
+ *            channel on another host, then you can use dst_host_filter
+ *            to manipulate channel values on TX and RX.
+ * flags    - Bitwise OR of any of the following:
+ *          - KNET_ADD_DAFATA_FLAG_RX_RETURN_INFO
+ *          - KNET_ADD_DAFATA_FLAG_TX_PROVIDE_DEST
+ *
+ * @return
+ * knet_handle_add_datafd_new returns
+ * @retval 0 on success,
+ *         *datafd  will be populated with a socket if the original value was 0
+ *            or if a specific fd was set, the value is untouched.
+ *         *channel will be populated with a channel number if the original value
+ *            was negative or the value is untouched if a specific channel
+ *            was requested.
+ *
+ * @retval -1 on error and errno is set.
+ *         *datafd and *channel are untouched or empty.
+ */
+
 int knet_handle_add_datafd(knet_handle_t knet_h, int *datafd, int8_t *channel);
 
 /**
@@ -521,6 +611,8 @@ int knet_send_sync(knet_handle_t knet_h,
  *    dst_host_ids_entries in the buffer.
  *  1 packet is broadcast/multicast and is sent all hosts.
  *    contents of dst_host_ids and dst_host_ids_entries are ignored.
+ *  2 packet already contains enough information to route it, provided
+ *    by the KNET_FDHEADER_* options
  *
  * @return
  * knet_handle_enable_filter returns
@@ -2698,5 +2790,50 @@ int knet_log_set_loglevel(knet_handle_t knet_h, uint8_t subsystem,
 
 int knet_log_get_loglevel(knet_handle_t knet_h, uint8_t subsystem,
 			  uint8_t *level);
+
+
+/**
+ * knet_buffer_add_data_item
+ *
+ * @brief Add a metadata item to the knet databuffer
+ *
+ * buf        - Pointer to the current position in the buffer
+ *
+ * buflen     - Remaining size of the buffer
+ *
+ * datatype   - KNET_FDHEADER_xx constant
+ *
+ * data       - Pointer to data to add
+ *
+ * datalen    - Length of data to add
+ *
+ * @return
+ * total number of bytes added to the buffer
+ * or -1 if the buffer was not large enough
+ */
+ssize_t knet_buffer_add_data_item(char *buf, size_t buflen, uint8_t datatype, const void *data, size_t datalen);
+
+/**
+ * knet_buffer_get_data_item
+ *
+ * @brief Get an a metadata item from the knet databuffer
+ *
+ * buf        - Pointer to the current position in the buffer
+ *
+ * buflen     - Remaining size of the buffer
+ *
+ * datatype   - Returned KNET_FDHEADER_xx constant
+ *
+ * data       - Pointer to data retrieved (in the buffer)
+ *
+ * datalen    - Length of data.
+ *
+ * @return
+ * total number of bytes saved in the data buffer
+ * This will always be retruned EVEN IF the data buffer is too short
+ * so callers can move onto the next item in the RX buffer
+ */
+
+ssize_t knet_buffer_get_data_item(const unsigned char *buf, size_t buflen, uint8_t *datatype, void *data, size_t *datalen);
 
 #endif

@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <errno.h>
+#include <arpa/inet.h>
 
 #include "compat.h"
 #include "compress.h"
@@ -146,21 +147,35 @@ static int _dispatch_to_local(knet_handle_t knet_h, unsigned char *data, size_t 
 	const unsigned char *buf = data;
 	ssize_t buflen = inlen;
 	struct knet_link *local_link = knet_h->host_index[knet_h->host_id]->link;
+	struct iovec iov_out[2];
+	uint32_t cur_iov = 0;
+	struct sockaddr_in local_ip;
+	char hdr_buf[KNET_MAX_FD_HEADER_SIZE];
+	int hdr_len = 0;
 
-local_retry:
-	err = write(knet_h->sockfd[channel].sockfd[knet_h->sockfd[channel].is_created], buf, buflen);
+#ifdef KNET_DATAFD_FLAG_RX_RETURN_INFO
+	if (knet_h->sockfd[channel].flags & KNET_DATAFD_FLAG_RX_RETURN_INFO) {
+		log_debug(knet_h, KNET_SUB_RX,
+			  "Adding header to local packet");
+		local_ip.sin_family = AF_INET;
+		local_ip.sin_addr.s_addr = inet_addr("127.0.0.1");
+		local_ip.sin_port = 0;
+		hdr_len = knet_buffer_add_data_item(hdr_buf, sizeof(hdr_buf), KNET_FDHEADER_IPADDR, &local_ip, sizeof(local_ip));
+		hdr_len += knet_buffer_add_data_item(hdr_buf+hdr_len, sizeof(hdr_buf), KNET_FDHEADER_END, NULL, 0);
+		iov_out[0].iov_base = &hdr_buf;
+		iov_out[0].iov_len = hdr_len;
+		cur_iov++;
+	}
+#endif
+	iov_out[cur_iov].iov_base = (void *)buf;
+	iov_out[cur_iov].iov_len = buflen;
+
+	err = writev_all(knet_h->sockfd[channel].sockfd[knet_h->sockfd[channel].is_created], iov_out, cur_iov+1, local_link);
 	savederrno = errno;
 	if (err < 0) {
 		log_err(knet_h, KNET_SUB_TRANSP_LOOPBACK, "send local failed. error=%s\n", strerror(errno));
 		local_link->status.stats.tx_data_errors++;
 		goto out;
-	}
-	if (err > 0 && err < buflen) {
-		log_debug(knet_h, KNET_SUB_TRANSP_LOOPBACK, "send local incomplete=%d bytes of %zu\n", err, inlen);
-		local_link->status.stats.tx_data_retries++;
-		buf += err;
-		buflen -= err;
-		goto local_retry;
 	}
 	if (err == buflen) {
 		local_link->status.stats.tx_data_packets++;
@@ -407,11 +422,11 @@ static int _get_tx_seq_num(knet_handle_t knet_h, seq_num_t *tx_seq_num)
 	return 0;
 }
 
-
+#include <stdio.h>
 static int _get_data_dests(knet_handle_t knet_h, unsigned char* data, size_t inlen,
 			   int8_t *channel, int *bcast, int *send_local,
 			   knet_node_id_t *dst_host_ids, size_t *dst_host_ids_entries,
-			   int is_sync)
+			   int is_sync, size_t *header_skip)
 {
 	int err = 0, savederrno = 0;
 	knet_node_id_t dst_host_ids_temp[KNET_MAX_HOST];	/* store destinations from filter */
@@ -420,8 +435,42 @@ static int _get_data_dests(knet_handle_t knet_h, unsigned char* data, size_t inl
 	struct knet_host *dst_host;
 	size_t host_idx;
 
+	/*
+	 * Look for routing information in the packet
+	 */
+	*bcast = 0;
+	if (knet_h->sockfd[*channel].flags & KNET_DATAFD_FLAG_TX_PROVIDE_INFO) {
+		char databuf[KNET_MAX_FD_HEADER_ITEM_SIZE];
+		size_t ptr = 0;
+		uint8_t datatype = 0;
+		do {
+			size_t data_len = sizeof(databuf); /* Needs re-initializing for each call */
+			size_t item_len = knet_buffer_get_data_item(data+ptr, inlen-ptr, &datatype, databuf, &data_len);
+			if (datatype == KNET_FDHEADER_NODEID) {
+				knet_node_id_t nodeid;
+				memcpy(&nodeid, databuf, data_len);
+				fprintf(stderr, "CC: KNET got nodeid %d from corosync\n", nodeid);
+				if (nodeid == 0) {
+					*bcast = 1;
+				} else {
+					dst_host_ids_temp[dst_host_ids_entries_temp++] = nodeid;
+				}
+			}
+			if (datatype == KNET_FDHEADER_CHANNEL) {
+				memcpy(channel, databuf, data_len);
+				fprintf(stderr, "CC: KNET got channel %d from corosync\n", (int)*channel);
+			}
+			ptr += item_len;
+			fprintf(stderr, "CC: KNET item_len=%ld\n", item_len);
+		} while (datatype != KNET_FDHEADER_END && ptr < inlen);
+		fprintf(stderr, "CC: KNET found %ld bytes of header to move past\n", ptr);
+		inlen -= ptr;
+		data += ptr;
+		*header_skip = ptr;
+	}
+
 	if (knet_h->dst_host_filter_fn) {
-		*bcast = knet_h->dst_host_filter_fn(
+		int resf = knet_h->dst_host_filter_fn(
 				knet_h->dst_host_filter_fn_private_data,
 				data,
 				inlen,
@@ -431,36 +480,41 @@ static int _get_data_dests(knet_handle_t knet_h, unsigned char* data, size_t inl
 				channel,
 				dst_host_ids_temp,
 				&dst_host_ids_entries_temp);
-		if (*bcast < 0) {
-			log_debug(knet_h, KNET_SUB_TX, "Error from dst_host_filter_fn: %d", *bcast);
-			savederrno = EFAULT;
+		/* If filter return 2 then it hasn't done anything and the routing should be in the header */
+		if (resf != 2) {
+			*bcast = resf;
+		}
+	}
+
+	if (*bcast < 0) {
+		log_debug(knet_h, KNET_SUB_TX, "Error from dst_host_filter_fn or knet_send: %d", *bcast);
+		savederrno = EFAULT;
+		err = -1;
+		goto out;
+	}
+
+	if ((!*bcast) && (!dst_host_ids_entries_temp)) {
+		log_debug(knet_h, KNET_SUB_TX, "Message is unicast but no dst_host_ids_entries");
+		savederrno = EINVAL;
+		err = -1;
+		goto out;
+	}
+
+	if ((!*bcast) &&
+	    (dst_host_ids_entries_temp > KNET_MAX_HOST)) {
+		log_debug(knet_h, KNET_SUB_TX, "dst_host_filter_fn or knet_send returned too many destinations");
+		savederrno = EINVAL;
+		err = -1;
+			goto out;
+	}
+
+	if (is_sync) {
+		if ((*bcast) ||
+		    ((!*bcast) && (dst_host_ids_entries_temp > 1))) {
+			log_debug(knet_h, KNET_SUB_TX, "knet_send_sync is only supported with unicast packets for one destination");
+			savederrno = E2BIG;
 			err = -1;
 			goto out;
-		}
-
-		if ((!*bcast) && (!dst_host_ids_entries_temp)) {
-			log_debug(knet_h, KNET_SUB_TX, "Message is unicast but no dst_host_ids_entries");
-			savederrno = EINVAL;
-			err = -1;
-			goto out;
-		}
-
-		if ((!*bcast) &&
-		    (dst_host_ids_entries_temp > KNET_MAX_HOST)) {
-			log_debug(knet_h, KNET_SUB_TX, "dst_host_filter_fn returned too many destinations");
-			savederrno = EINVAL;
-			err = -1;
-			goto out;
-		}
-
-		if (is_sync) {
-			if ((*bcast) ||
-			    ((!*bcast) && (dst_host_ids_entries_temp > 1))) {
-				log_debug(knet_h, KNET_SUB_TX, "knet_send_sync is only supported with unicast packets for one destination");
-				savederrno = E2BIG;
-				err = -1;
-				goto out;
-			}
 		}
 	}
 
@@ -585,6 +639,7 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, size_t inlen, int8_t chan
 	struct iovec iov_out[PCKT_FRAG_MAX][2];
 	int iovcnt_out = 2;
 	int msgs_to_send = 0;
+	size_t header_skip = 0;
 
 	if (knet_h->enabled != 1) {
 		log_debug(knet_h, KNET_SUB_TX, "Received data packet but forwarding is disabled");
@@ -616,12 +671,13 @@ static int _parse_recv_from_sock(knet_handle_t knet_h, size_t inlen, int8_t chan
 	err = _get_data_dests(knet_h, data, inlen,
 			      &channel, &bcast, &send_local,
 			      dst_host_ids, &dst_host_ids_entries,
-			      is_sync);
+			      is_sync, &header_skip);
 	if (err < 0) {
 		savederrno = errno;
 		goto out;
 	}
 
+	data += header_skip;
 	/* Send to localhost if appropriate and enabled */
 	if (send_local) {
 		err = _dispatch_to_local(knet_h, data, inlen, channel);
