@@ -278,6 +278,17 @@ fn configure_link(knet_handle: &knet::Handle, our_hostid: &knet::HostId, other_h
 	}
     }
 
+   // This is just to exercise the API
+   match knet::handle_add_datafd_new(knet_handle, 0, CHANNEL+1, knet::DataFdFlags::KNET_DATAFD_FLAG_RX_RETURN_INFO) {
+	Ok((fd,chan)) => {
+	    println!("Added datafd, fd={fd}, channel={chan}");
+	},
+	Err(e) => {
+	    println!("Error from add_datafd: {e}");
+	    return Err(e);
+	}
+    }
+
     if let Err(e) = knet::handle_crypto_rx_clear_traffic(knet_handle, knet::RxClearTraffic::Allow) {
 	println!("Error from handle_crypto_rx_clear_traffic: {e}");
 	return Err(e);

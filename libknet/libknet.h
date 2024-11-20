@@ -92,6 +92,11 @@ typedef uint16_t knet_node_id_t;
 #define KNET_HANDLE_FLAG_PRIVILEGED (1ULL << 0)
 
 /*
+ * Flags that affect what appears (and should be provided) on the datafd
+ */
+#define KNET_DATAFD_FLAG_RX_RETURN_INFO  (1ULL << 0)
+
+/*
  * threads timer resolution (see knet_handle_set_threads_timer_res below)
  */
 
@@ -330,8 +335,85 @@ int knet_handle_enable_sock_notify(knet_handle_t knet_h,
  * @retval -1 on error and errno is set.
  *         *datafd and *channel are untouched or empty.
  */
-
 int knet_handle_add_datafd(knet_handle_t knet_h, int *datafd, int8_t *channel);
+
+struct knet_datafd_header {
+	/** Size of the structure. Used for backwards compatibilty. Only use fields up to the
+	    size you were compiled with, but advance to the end of the struct using the
+	    size field here */
+	size_t size;
+	/** nodeid of node sending this message */
+	knet_node_id_t src_nodeid;
+};
+
+/**
+ * knet_handle_add_datafd_new
+ *
+ * @brief Install a file descriptor for communication
+ *
+ * IMPORTANT: In order to add datafd to knet, knet_handle_enable_sock_notify
+ *            _MUST_ be set and be able to handle both errors (-1) and
+ *            0 bytes read / write from the provided datafd.
+ *            On read error (< 0) from datafd, the socket is automatically
+ *            removed from polling to avoid spinning on dead sockets.
+ *            It is safe to call knet_handle_remove_datafd even on sockets
+ *            that have been removed.
+ *
+ * knet_h   - pointer to knet_handle_t
+ *
+ * *datafd  - read/write file descriptor.
+ *            knet will read data here to send to the other hosts
+ *            and will write data received from the network.
+ *            Each data packet can be of max size KNET_MAX_PACKET_SIZE!
+ *            Applications using knet_send/knet_recv will receive a
+ *            proper error if the packet size is not within boundaries.
+ *            Applications using their own functions to write to the
+ *            datafd should NOT write more than KNET_MAX_PACKET_SIZE.
+ *
+ *            Please refer to handle.c on how to set up a socketpair.
+ *
+ *            datafd can be 0, and knet_handle_add_datafd will create a properly
+ *            populated socket pair the same way as ping_test, or a value
+ *            higher than 0. A negative number will return an error.
+ *            On exit knet_handle_free will take care to cleanup the
+ *            socketpair only if they have been created by knet_handle_add_datafd.
+ *
+ *            It is possible to pass either sockets or normal fds.
+ *            User provided datafd will be marked as non-blocking and close-on-exec.
+ *
+ * *channel - This value is analogous to the tag in VLAN tagging.
+ *            A negative value will auto-allocate a channel.
+ *            Setting a value between 0 and 31 will try to allocate that
+ *            specific channel (unless already in use).
+ *
+ *            It is possible to add up to 32 datafds but be aware that each
+ *            one of them must have a receiving end on the other host.
+ *
+ *            Example:
+ *            hostA channel 0 will be delivered to datafd on hostB channel 0
+ *            hostA channel 1 to hostB channel 1.
+ *
+ *            Each channel must have a unique file descriptor.
+ *
+ *            If your application could have 2 channels on one host and one
+ *            channel on another host, then you can use dst_host_filter
+ *            to manipulate channel values on TX and RX.
+ * flags    - Bitwise OR of any of the following:
+ *          - KNET_ADD_DAFATA_FLAG_RX_RETURN_INFO
+ *
+ * @return
+ * knet_handle_add_datafd_new returns
+ * @retval 0 on success,
+ *         *datafd  will be populated with a socket if the original value was 0
+ *            or if a specific fd was set, the value is untouched.
+ *         *channel will be populated with a channel number if the original value
+ *            was negative or the value is untouched if a specific channel
+ *            was requested.
+ *
+ * @retval -1 on error and errno is set.
+ *         *datafd and *channel are untouched or empty.
+ */
+int knet_handle_add_datafd_new(knet_handle_t knet_h, int *datafd, int8_t *channel, uint32_t flags);
 
 /**
  * knet_handle_remove_datafd

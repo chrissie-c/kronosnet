@@ -15,6 +15,7 @@ api_checks		= \
 			  api_knet_handle_enable_filter_test \
 			  api_knet_handle_enable_sock_notify_test \
 			  api_knet_handle_add_datafd_test \
+			  api_knet_handle_add_datafd_new_test \
 			  api_knet_handle_remove_datafd_test \
 			  api_knet_handle_get_channel_test \
 			  api_knet_handle_get_datafd_test \
@@ -110,6 +111,9 @@ api_knet_handle_enable_sock_notify_test_SOURCES = api_knet_handle_enable_sock_no
 						  test-common.c
 
 api_knet_handle_add_datafd_test_SOURCES = api_knet_handle_add_datafd.c \
+					  test-common.c
+
+api_knet_handle_add_datafd_new_test_SOURCES = api_knet_handle_add_datafd_new.c \
 					  test-common.c
 
 api_knet_handle_remove_datafd_test_SOURCES = api_knet_handle_remove_datafd.c \

@@ -19,6 +19,7 @@ if BUILD_MAN
 knet_man3_MANS = \
 		knet_addrtostr.3 \
 		knet_handle_add_datafd.3 \
+		knet_handle_add_datafd_new.3 \
 		knet_handle_clear_stats.3 \
 		knet_handle_compress.3 \
 		knet_handle_enable_filter.3 \
