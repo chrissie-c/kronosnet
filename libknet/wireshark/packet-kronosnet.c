@@ -1,6 +1,6 @@
 /* packet-kronosnet.c
  * Routines for the Kronosnet (kronosnet) protocol used by corosync
- * corosync packets are NOT dcoded by this dissector
+ * corosync packets are NOT decoded by this dissector
  * (c) 2026 Red Hat etc....
  *
  * Wireshark - Network traffic analyzer
@@ -10,15 +10,24 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#include "config.h"
+//#include "config.h"
 
 #include <epan/packet.h>
 #include <epan/prefs.h>
+#include <wsutil/file_util.h>
 
+#include "../libknet.h"
+#include "../crypto.h"
 #include "packet-kronosnet.h"
 
 void proto_register_kronosnet(void);
 void proto_reg_handoff_kronosnet(void);
+
+
+WS_DLL_PUBLIC_DEF const char plugin_version[] = "1.0";
+WS_DLL_PUBLIC_DEF const int plugin_want_major = 4;
+WS_DLL_PUBLIC_DEF const int plugin_want_minor = 6;
+
 
 #define PROTO_TAG_KRONOSNET      "Kronosnet"    /*!< Definition of kronosnet Protocol */
 #define PORT 5405           /* Not IANA registered */
@@ -48,10 +57,13 @@ static int ett_kronosnet;
 static int ett_kronosnet_data;
 static int ett_kronosnet_ping;
 static int ett_kronosnet_pmtu;
-
-static const char *kronosnet_private_key;
+static const char *kronosnet_private_key_file;
 static const char *kronosnet_crypto_cipher;
 static const char *kronosnet_crypto_hash;
+static const char *private_key;
+
+static int crypto_initialised = 0;
+static knet_handle_t knet_h;
 
 // Header fields
 static int hf_kh_version; /* this pckt format/version */
@@ -149,6 +161,34 @@ static int dissect_pmtud_v1(proto_tree *pt, tvbuff_t *tvb, int offset, char *nam
     return offset;
 }
 
+static int read_key_file(packet_info *pinfo)
+{
+    FILE *fp;
+    long fsize = 0;
+    char *buf;
+
+    fp = ws_fopen(kronosnet_private_key_file, "rb");
+    if (fp != NULL) {
+        fseek(fp, 0, SEEK_END);
+        fsize = ftell(fp);
+        if (fsize == -1L) {
+            fclose(fp);
+            return -1;
+        }
+        fseek(fp, 0, SEEK_SET);
+
+        buf = (char*)wmem_alloc(pinfo->pool, fsize + 1);
+        if (fread(buf, 1, fsize, fp) != (size_t)fsize) {
+            fclose(fp);
+            return -1;
+        }
+        buf[fsize] = '\0';
+        fclose(fp);
+    }
+    private_key = buf;
+    return fsize;
+}
+
 /**
  * dissect_kronosnet is the dissector which is called
  * by Wireshark when kronosnet UDP packets are captured.
@@ -162,15 +202,40 @@ static int
 dissect_kronosnet(tvbuff_t *tvb, packet_info *pinfo, __attribute__((unused)) proto_tree *tree, void* data _U_)
 {
     /* Only decrypt if we have ALL of the information we need */
-    if (kronosnet_private_key &&
+    if (kronosnet_private_key_file &&
         kronosnet_crypto_cipher &&
         kronosnet_crypto_hash) {
-
-
-
+        if (!crypto_initialised) {
+            // Init openssl
+            knet_h = knet_handle_new(0, 0, 0, 0);
+            if (knet_h) {
+                ws_warning("Kronsnet: Failed to get knet_handle");
+            }
+            struct knet_handle_crypto_cfg ccfg;
+            strcpy(ccfg.crypto_model, "openssl");
+            strcpy(ccfg.crypto_cipher_type, kronosnet_crypto_hash);
+            strcpy(ccfg.crypto_cipher_type, kronosnet_crypto_cipher);
+            ccfg.private_key_len = read_key_file(pinfo);
+            if (ccfg.private_key_len > 0) {
+                memcpy(ccfg.private_key, private_key, ccfg.private_key_len);
+                if (knet_handle_crypto_set_config(knet_h, &ccfg, 0) != 0) {
+                    ws_warning("Kronsnet: Failed to init crypto");
+                }
+            } else {
+                ws_warning("Kronsnet: Failed to read private key");
+            }
+            crypto_initialised = 1;
+        }
+        // decrypt packet and reset tvb etc
+        int res = authenticate_and_decrypt(knet_h,
+                                           inbuf, size
+                                           outbuf, size);
+        if (!res) {
+            ws_warning("Kronsnet: Failed to decrypt packet");
+        } else {
+            char *newbuf = (char*)wmem_alloc(pinfo->pool, tvb->get_ptr(tvb, 0,len??));
+        }
     }
-
-
 
     int offset = 0;
     int type = 0;
@@ -383,9 +448,9 @@ proto_register_kronosnet(void)
 
     /* Prefs to get encryption parameters */
     kronosnet_module = prefs_register_protocol(proto_kronosnet, NULL);
-    prefs_register_string_preference(kronosnet_module, "private_key", "Private key",
-                                     "Key used to encryption",
-                                     &kronosnet_private_key);
+    prefs_register_filename_preference(kronosnet_module, "private_key_file", "Private key filename",
+                                     "File containting key used to encryption",
+                                       &kronosnet_private_key_file, false);
     prefs_register_string_preference(kronosnet_module, "crypto_cipher", "Crypto Cipher",
                                      "encrpytion cipher",
                                      &kronosnet_crypto_cipher);
@@ -404,6 +469,18 @@ proto_reg_handoff_kronosnet(void)
 {
     dissector_add_uint_with_preference("udp.port", PORT, kronosnet_handle);
 }
+
+
+WS_DLL_PUBLIC_DEF void plugin_register(void)
+{
+    static proto_plugin plug_kronosnet;
+
+    plug_kronosnet.register_protoinfo = proto_register_kronosnet;
+    plug_kronosnet.register_handoff = proto_reg_handoff_kronosnet;
+    proto_register_plugin(&plug_kronosnet);
+}
+
+
 /*
 * Editor modelines - https://www.wireshark.org/tools/modelines.html
 *

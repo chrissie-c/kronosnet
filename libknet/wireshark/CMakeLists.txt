@@ -29,7 +29,7 @@ check_type_size("ssize_t" SSIZE_T)
 
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 if(CMAKE_COMPILER_IS_GNUCC)
-    set(CMAKE_C_FLAGS  "-Wall -Wextra ${CMAKE_C_FLAGS}")
+    set(CMAKE_C_FLAGS  "-Wall -Wextra ${CMAKE_C_FLAGS} -I ../.. -lknet")
 endif()
 
 add_compile_definitions(
