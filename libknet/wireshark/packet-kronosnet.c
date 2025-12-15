@@ -201,6 +201,8 @@ static int read_key_file(packet_info *pinfo)
 static int
 dissect_kronosnet(tvbuff_t *tvb, packet_info *pinfo, __attribute__((unused)) proto_tree *tree, void* data _U_)
 {
+    tvbuff_t *next_tvb = NULL;
+
     /* Only decrypt if we have ALL of the information we need */
     if (kronosnet_private_key_file &&
         kronosnet_crypto_cipher &&
@@ -227,15 +229,23 @@ dissect_kronosnet(tvbuff_t *tvb, packet_info *pinfo, __attribute__((unused)) pro
             crypto_initialised = 1;
         }
         // decrypt packet and reset tvb etc
-        int res = authenticate_and_decrypt(knet_h,
-                                           inbuf, size
-                                           outbuf, size);
+        int len = tvb_captured_length_remaining(tvb, 0);
+        unsigned char *newbuf = (unsigned char*)wmem_alloc(pinfo->pool, len);
+        ssize_t outlen = len;
+        int res = crypto_authenticate_and_decrypt(knet_h,
+                                                  tvb_memdup(pinfo->pool, tvb, 0, -1), len,
+                                                  newbuf, &outlen);
         if (!res) {
             ws_warning("Kronsnet: Failed to decrypt packet");
         } else {
-            char *newbuf = (char*)wmem_alloc(pinfo->pool, tvb->get_ptr(tvb, 0,len??));
+            next_tvb = tvb_new_child_real_data(tvb, newbuf, len, outlen);
         }
     }
+
+    if (next_tvb == NULL) {
+        return 0;
+    }
+
 
     int offset = 0;
     int type = 0;
@@ -246,45 +256,45 @@ dissect_kronosnet(tvbuff_t *tvb, packet_info *pinfo, __attribute__((unused)) pro
     col_clear(pinfo->cinfo,COL_INFO);
 
     // Might need to change this to allow us to encapsulate corosync (if that ever happens)
-    proto_item *ti = proto_tree_add_item(tree, proto_kronosnet, tvb, 0, -1, ENC_NA);
+    proto_item *ti = proto_tree_add_item(tree, proto_kronosnet, next_tvb, 0, -1, ENC_NA);
 
     proto_tree *kronosnet_tree = proto_item_add_subtree(ti, ett_kronosnet);
-    proto_tree_add_item(kronosnet_tree, hf_kronosnet_packet_type, tvb, 0, 1, ENC_BIG_ENDIAN);
+    proto_tree_add_item(kronosnet_tree, hf_kronosnet_packet_type, next_tvb, 0, 1, ENC_BIG_ENDIAN);
 
-    proto_tree_add_item(kronosnet_tree, hf_kh_version, tvb, offset, 1, ENC_BIG_ENDIAN);
-    version = tvb_get_uint8(tvb, offset);
+    proto_tree_add_item(kronosnet_tree, hf_kh_version, next_tvb, offset, 1, ENC_BIG_ENDIAN);
+    version = tvb_get_uint8(next_tvb, offset);
     offset += 1;
-    proto_tree_add_item(kronosnet_tree, hf_kh_type, tvb, offset, 1, ENC_BIG_ENDIAN);
-    type = tvb_get_uint8(tvb, offset);
+    proto_tree_add_item(kronosnet_tree, hf_kh_type, next_tvb, offset, 1, ENC_BIG_ENDIAN);
+    type = tvb_get_uint8(next_tvb, offset);
     offset += 1;
-    proto_tree_add_item(kronosnet_tree, hf_kh_node, tvb, offset, 2, ENC_BIG_ENDIAN);
+    proto_tree_add_item(kronosnet_tree, hf_kh_node, next_tvb, offset, 2, ENC_BIG_ENDIAN);
     offset += 2;
-    proto_tree_add_item(kronosnet_tree, hf_kh_max_ver, tvb, offset, 1, ENC_BIG_ENDIAN);
+    proto_tree_add_item(kronosnet_tree, hf_kh_max_ver, next_tvb, offset, 1, ENC_BIG_ENDIAN);
     offset += 1;
-    proto_tree_add_item(kronosnet_tree, hf_kh_pad1, tvb, offset, 1, ENC_BIG_ENDIAN);
+    proto_tree_add_item(kronosnet_tree, hf_kh_pad1, next_tvb, offset, 1, ENC_BIG_ENDIAN);
     offset += 1;
 
     if (version == 1) {
         switch (type) {
             case KRONOSNET_HEADER_TYPE_DATA:
-                offset = dissect_data_v1(kronosnet_tree, tvb, offset);
+                offset = dissect_data_v1(kronosnet_tree, next_tvb, offset);
                 break;
             case KRONOSNET_HEADER_TYPE_PING:
-                offset = dissect_ping_v1(kronosnet_tree, tvb, offset, "Ping");
+                offset = dissect_ping_v1(kronosnet_tree, next_tvb, offset, "Ping");
                 break;
             case KRONOSNET_HEADER_TYPE_PONG:
-                offset = dissect_ping_v1(kronosnet_tree, tvb, offset, "Pong");
+                offset = dissect_ping_v1(kronosnet_tree, next_tvb, offset, "Pong");
                 break;
             case KRONOSNET_HEADER_TYPE_PMTUD:
-                offset = dissect_pmtud_v1(kronosnet_tree, tvb, offset, "pMTUd");
+                offset = dissect_pmtud_v1(kronosnet_tree, next_tvb, offset, "pMTUd");
                 break;
             case KRONOSNET_HEADER_TYPE_PMTUD_REPLY:
-                offset = dissect_pmtud_v1(kronosnet_tree, tvb, offset, "pMTUd Reply");
+                offset = dissect_pmtud_v1(kronosnet_tree, next_tvb, offset, "pMTUd Reply");
                 break;
         }
     }
 
-    return tvb_captured_length(tvb);
+    return tvb_captured_length(next_tvb);
 }
 /**
  * proto_register_kronosnet registers our kronosnet protocol,

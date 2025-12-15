@@ -29,7 +29,7 @@ check_type_size("ssize_t" SSIZE_T)
 
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 if(CMAKE_COMPILER_IS_GNUCC)
-    set(CMAKE_C_FLAGS  "-Wall -Wextra ${CMAKE_C_FLAGS} -I ../.. -lknet")
+    set(CMAKE_C_FLAGS  "-Wall -Wextra ${CMAKE_C_FLAGS} -I ../.. -DPLUGINPATH=\"/usr/lib64/kronsnet\"")
 endif()
 
 add_compile_definitions(
@@ -47,6 +47,9 @@ target_link_libraries(kronosnet epan)
 install(TARGETS kronosnet
 	LIBRARY DESTINATION "${Wireshark_PLUGIN_LIBDIR}/epan" NAMELINK_SKIP
 )
+
+#target_sources(kronosnet PRIVATE ../crypto.c ../lib_config.c ../threads_common.c ../onwire.c ../common.c ../logging.c ../handle.c ../threads_tx.c ../threads_dsthandler.c ../threads_pmtu.c)
+target_link_libraries(kronosnet knet)
 
 # This custom target installs the plugin to the plugin dir in WiresharkConfig.cmake.
 # It does not use CMAKE_INSTALL_PREFIX.

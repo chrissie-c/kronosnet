@@ -605,7 +605,9 @@ knet_handle_t knet_handle_new(knet_node_id_t host_id,
 	/*
 	 * Set the default path for plugins
 	 */
-	knet_h->plugin_path = PLUGINPATH;
+// CC: TEMP while I get the build system to allow this
+//	knet_h->plugin_path = PLUGINPATH;
+	knet_h->plugin_path = "/usr/lib64/kronosnet";
 
 	/*
 	 * Set 'min' stats to the maximum value so the
